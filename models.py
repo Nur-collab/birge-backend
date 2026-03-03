@@ -57,3 +57,18 @@ class ChatMessage(Base):
 
     trip = relationship("Trip", backref="messages")
     sender = relationship("User")
+
+# Запросы на поездку (пассажир → водитель)
+class TripRequest(Base):
+    __tablename__ = "trip_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trip_id = Column(Integer, ForeignKey("trips.id"))            # поездка водителя
+    requester_trip_id = Column(Integer, ForeignKey("trips.id"))  # поездка пассажира
+    requester_id = Column(Integer, ForeignKey("users.id"))       # кто запрашивает
+    driver_id = Column(Integer, ForeignKey("users.id"))          # кому адресован запрос
+    status = Column(String, default="pending")                   # pending, accepted, declined
+    created_at = Column(String)
+
+    requester = relationship("User", foreign_keys=[requester_id])
+    driver = relationship("User", foreign_keys=[driver_id])

@@ -354,3 +354,108 @@ def create_review(review: schemas.ReviewCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_review)
     return new_review
+
+
+# --- TRIP REQUESTS (запросы на поездку) ---
+
+from datetime import datetime
+
+@app.post("/trip-requests/")
+def send_trip_request(payload: dict, db: Session = Depends(get_db)):
+    """Пассажир отправляет запрос водителю на поездку"""
+    trip_id = payload.get("trip_id")          # ID поездки водителя
+    requester_trip_id = payload.get("requester_trip_id")  # ID поездки пассажира
+    requester_id = payload.get("requester_id")  # ID пассажира
+    driver_id = payload.get("driver_id")       # ID водителя
+
+    # Проверяем не отправлял ли уже
+    existing = db.query(models.TripRequest).filter(
+        models.TripRequest.trip_id == trip_id,
+        models.TripRequest.requester_id == requester_id,
+        models.TripRequest.status == "pending"
+    ).first()
+    if existing:
+        return {"id": existing.id, "status": "pending", "message": "Already sent"}
+
+    req = models.TripRequest(
+        trip_id=trip_id,
+        requester_trip_id=requester_trip_id,
+        requester_id=requester_id,
+        driver_id=driver_id,
+        status="pending",
+        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return {"id": req.id, "status": "pending"}
+
+
+@app.get("/trip-requests/incoming/{user_id}")
+def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
+    """Водитель получает входящие запросы (pending)"""
+    requests = db.query(models.TripRequest).filter(
+        models.TripRequest.driver_id == user_id,
+        models.TripRequest.status == "pending"
+    ).all()
+
+    result = []
+    for r in requests:
+        requester = db.query(models.User).filter(models.User.id == r.requester_id).first()
+        driver_trip = db.query(models.Trip).filter(models.Trip.id == r.trip_id).first()
+        result.append({
+            "id": r.id,
+            "trip_id": r.trip_id,
+            "requester_trip_id": r.requester_trip_id,
+            "requester_id": r.requester_id,
+            "requester_name": requester.name if requester else "Пассажир",
+            "requester_photo": requester.photo if requester else "",
+            "requester_rating": requester.trust_rating if requester else 5.0,
+            "origin": driver_trip.origin if driver_trip else "",
+            "destination": driver_trip.destination if driver_trip else "",
+            "time": driver_trip.time if driver_trip else "",
+            "status": r.status,
+            "created_at": r.created_at,
+        })
+    return result
+
+
+@app.patch("/trip-requests/{request_id}")
+def respond_to_request(request_id: int, payload: dict, db: Session = Depends(get_db)):
+    """Водитель принимает (accepted) или отклоняет (declined) запрос"""
+    req = db.query(models.TripRequest).filter(models.TripRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    new_status = payload.get("status")  # 'accepted' or 'declined'
+    req.status = new_status
+    db.commit()
+
+    # Если принят — возвращаем trip_id для обоих (чтобы перейти в чат)
+    return {
+        "id": req.id,
+        "status": new_status,
+        "trip_id": req.trip_id,
+        "requester_trip_id": req.requester_trip_id,
+        "requester_id": req.requester_id,
+        "driver_id": req.driver_id,
+    }
+
+
+@app.get("/trip-requests/status/{requester_id}/{trip_id}")
+def check_request_status(requester_id: int, trip_id: int, db: Session = Depends(get_db)):
+    """Пассажир проверяет статус своего запроса (polling)"""
+    req = db.query(models.TripRequest).filter(
+        models.TripRequest.trip_id == trip_id,
+        models.TripRequest.requester_id == requester_id,
+    ).order_by(models.TripRequest.id.desc()).first()
+
+    if not req:
+        return {"status": "not_sent"}
+    return {
+        "id": req.id,
+        "status": req.status,
+        "trip_id": req.trip_id,
+        "requester_trip_id": req.requester_trip_id,
+        "driver_id": req.driver_id,
+    }
