@@ -477,6 +477,7 @@ def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
     result = []
     for r in requests:
         requester = db.query(models.User).filter(models.User.id == r.requester_id).first()
+        driver = db.query(models.User).filter(models.User.id == r.driver_id).first()
         driver_trip = db.query(models.Trip).filter(models.Trip.id == r.trip_id).first()
         result.append({
             "id": r.id,
@@ -491,6 +492,10 @@ def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
             "time": driver_trip.time if driver_trip else "",
             "status": r.status,
             "created_at": r.created_at,
+            # Данные машины водителя
+            "driver_car_model": driver.car_model if driver else None,
+            "driver_car_plate": driver.car_plate if driver else None,
+            "driver_car_color": driver.car_color if driver else None,
         })
     return result
 
@@ -527,10 +532,18 @@ def check_request_status(requester_id: int, trip_id: int, db: Session = Depends(
 
     if not req:
         return {"status": "not_sent"}
+
+    # Добавляем данные машины водителя
+    driver = db.query(models.User).filter(models.User.id == req.driver_id).first()
     return {
         "id": req.id,
         "status": req.status,
         "trip_id": req.trip_id,
         "requester_trip_id": req.requester_trip_id,
         "driver_id": req.driver_id,
+        "driver_name": driver.name if driver else None,
+        "driver_photo": driver.photo if driver else None,
+        "driver_car_model": driver.car_model if driver else None,
+        "driver_car_plate": driver.car_plate if driver else None,
+        "driver_car_color": driver.car_color if driver else None,
     }
