@@ -509,9 +509,17 @@ def respond_to_request(request_id: int, payload: dict, db: Session = Depends(get
 
     new_status = payload.get("status")  # 'accepted' or 'declined'
     req.status = new_status
-    db.commit()
 
-    # Если принят — возвращаем trip_id для обоих (чтобы перейти в чат)
+    # Если принят — увеличиваем счётчик мест явно
+    if new_status == "accepted":
+        trip = db.query(models.Trip).filter(models.Trip.id == req.trip_id).first()
+        if trip:
+            trip.seats_taken = (trip.seats_taken or 0) + 1
+            # Если все места заняты — закрываем набор
+            if trip.seats_taken >= (trip.seats or 3):
+                trip.status = "matched"
+
+    db.commit()
     return {
         "id": req.id,
         "status": new_status,
@@ -533,7 +541,6 @@ def check_request_status(requester_id: int, trip_id: int, db: Session = Depends(
     if not req:
         return {"status": "not_sent"}
 
-    # Добавляем данные машины водителя
     driver = db.query(models.User).filter(models.User.id == req.driver_id).first()
     return {
         "id": req.id,
@@ -546,4 +553,37 @@ def check_request_status(requester_id: int, trip_id: int, db: Session = Depends(
         "driver_car_model": driver.car_model if driver else None,
         "driver_car_plate": driver.car_plate if driver else None,
         "driver_car_color": driver.car_color if driver else None,
+    }
+
+
+@app.get("/trips/{trip_id}/passengers")
+def get_trip_passengers(trip_id: int, db: Session = Depends(get_db)):
+    """Список принятых пассажиров для поездки водителя"""
+    trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    accepted = db.query(models.TripRequest).filter(
+        models.TripRequest.trip_id == trip_id,
+        models.TripRequest.status == "accepted"
+    ).all()
+
+    passengers = []
+    for r in accepted:
+        user = db.query(models.User).filter(models.User.id == r.requester_id).first()
+        if user:
+            passengers.append({
+                "id": user.id,
+                "name": user.name,
+                "photo": user.photo,
+                "trust_rating": user.trust_rating,
+                "is_verified": user.is_verified,
+                "request_id": r.id,
+            })
+
+    return {
+        "trip_id": trip_id,
+        "seats": trip.seats or 3,
+        "seats_taken": trip.seats_taken or 0,
+        "passengers": passengers,
     }

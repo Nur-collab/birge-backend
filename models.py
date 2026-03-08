@@ -32,6 +32,8 @@ class Trip(Base):
     destination = Column(String)
     time = Column(String)
     status = Column(String, default="active") # active, matched, completed
+    seats = Column(Integer, default=3)        # макс мест (для водителя)
+    seats_taken = Column(Integer, default=0)  # занято мест
 
     user = relationship("User", back_populates="trips")
 

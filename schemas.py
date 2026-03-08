@@ -52,6 +52,7 @@ class TripBase(BaseModel):
     origin: str
     destination: str
     time: str
+    seats: int = 3  # макс мест (для водителя)
 
 class TripCreate(TripBase):
     user_id: int
@@ -60,6 +61,7 @@ class Trip(TripBase):
     id: int
     user_id: int
     status: str
+    seats_taken: int = 0
     user: Optional[User] = None
 
     class Config:
