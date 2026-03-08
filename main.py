@@ -8,6 +8,27 @@ import random
 # Initialize DB tables
 models.Base.metadata.create_all(bind=database.engine)
 
+# Миграция: добавляем новые колонки если их нет (для существующих баз)
+def run_migrations():
+    with database.engine.connect() as conn:
+        migrations = [
+            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats INTEGER DEFAULT 3",
+            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats_taken INTEGER DEFAULT 0",
+        ]
+        for sql in migrations:
+            try:
+                conn.execute(database.text(sql))
+            except Exception:
+                pass
+        conn.commit()
+
+try:
+    from sqlalchemy import text as _text
+    database.text = _text
+    run_migrations()
+except Exception as e:
+    print(f"Migration warning: {e}")
+
 app = FastAPI(title="Birge API - MVP Backend")
 
 # Разрешаем запросы с нашего React приложения (CORS)
