@@ -1,6 +1,7 @@
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Float
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Float, DateTime
 from sqlalchemy.orm import relationship
 from database import Base
+from datetime import datetime
 
 class User(Base):
     __tablename__ = "users"
@@ -74,3 +75,15 @@ class TripRequest(Base):
 
     requester = relationship("User", foreign_keys=[requester_id])
     driver = relationship("User", foreign_keys=[driver_id])
+
+
+# SMS-коды: хранятся в БД (не теряются при рестарте)
+class SmsCode(Base):
+    __tablename__ = "sms_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, index=True)
+    code = Column(String)
+    expires_at = Column(DateTime)       # Когда код истекает (5 минут)
+    last_sent_at = Column(DateTime)     # Когда последний раз отправляли (rate limit)
+    is_used = Column(Boolean, default=False)

@@ -78,21 +78,25 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
 # --- AUTH ---
 @app.post("/auth/send-code")
 def send_code(payload: dict, db: Session = Depends(get_db)):
-    """Имитирует отправку SMS-кода. В продакшене здесь будет реальный SMS провайдер."""
+    """Отправка SMS-кода. Rate limit: 1 запрос в 60 секунд на номер."""
     phone = payload.get("phone", "").strip()
     if not phone:
         raise HTTPException(status_code=400, detail="Phone number required")
-    
+
     # Генерируем 6-значный код
     code = str(random.randint(100000, 999999))
-    auth.save_sms_code(phone, code)
-    
+
+    # Сохраняем в БД (с проверкой rate limit)
+    ok, error_msg = auth.save_sms_code(phone, code, db)
+    if not ok:
+        raise HTTPException(status_code=429, detail=error_msg)
+
     # В продакшене: отправить SMS через Twilio/SMS.ru
     print(f"\n{'='*40}")
     print(f"📱 SMS ДЛЯ {phone}")
     print(f"👉 ВАШ КОД БИРГЕ: {code} 👈")
     print(f"{'='*40}\n")
-    
+
     return {"message": "Code sent. Пожалуйста, проверьте SMS (или консоль сервера)."}
 
 @app.post("/auth/verify-code")
@@ -101,8 +105,8 @@ def verify_code(payload: dict, db: Session = Depends(get_db)):
     phone = payload.get("phone", "").strip()
     code = payload.get("code", "").strip()
     name = payload.get("name", "").strip()
-    
-    if not auth.verify_sms_code(phone, code):
+
+    if not auth.verify_sms_code(phone, code, db):
         raise HTTPException(status_code=400, detail="Invalid or expired code")
     
     # Ищем существующего пользователя или создаём нового
@@ -421,6 +425,29 @@ def update_trip_status(trip_id: int, payload: dict, db: Session = Depends(get_db
     trip.status = new_status
     db.commit()
     return {"id": trip_id, "status": new_status}
+
+
+@app.delete("/trips/{trip_id}")
+def cancel_trip(trip_id: int, authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """Отмена активной поездки текущим пользователем."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = authorization[7:]
+    user_id = auth.verify_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    trip = db.query(models.Trip).filter(
+        models.Trip.id == trip_id,
+        models.Trip.user_id == user_id
+    ).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found or access denied")
+
+    db.delete(trip)
+    db.commit()
+    return {"id": trip_id, "deleted": True}
 
 
 # --- REVIEWS ---
