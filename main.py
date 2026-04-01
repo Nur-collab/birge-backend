@@ -838,3 +838,21 @@ async def set_telegram_webhook():
             print(f"[Telegram] ✅ Webhook установлен: {webhook_url}")
         else:
             print(f"[Telegram] ❌ Ошибка webhook: {result}")
+
+
+# --- DEBUG: проверка привязок Telegram (временный эндпоинт) ---
+@app.get("/debug/telegram-bindings")
+def debug_telegram_bindings(db: Session = Depends(get_db)):
+    """Показывает все записи TelegramBinding в БД. Удалить после отладки."""
+    from models import TelegramBinding
+    bindings = db.query(TelegramBinding).all()
+    return [
+        {
+            "id": b.id,
+            "phone": b.phone,
+            "phone_digits": "".join(filter(str.isdigit, b.phone)),
+            "chat_id": b.chat_id,
+            "created_at": str(b.created_at),
+        }
+        for b in bindings
+    ]
