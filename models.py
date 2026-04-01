@@ -87,3 +87,14 @@ class SmsCode(Base):
     expires_at = Column(DateTime)       # Когда код истекает (5 минут)
     last_sent_at = Column(DateTime)     # Когда последний раз отправляли (rate limit)
     is_used = Column(Boolean, default=False)
+
+
+# Telegram: привязка номера телефона к chat_id
+# Заполняется когда пользователь шлёт /start <phone> боту
+class TelegramBinding(Base):
+    __tablename__ = "telegram_bindings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, unique=True, index=True)   # "+996 555 123 456"
+    chat_id = Column(Integer, index=True)              # Telegram chat_id пользователя
+    created_at = Column(DateTime, default=datetime.utcnow)

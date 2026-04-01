@@ -1,9 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import database, models, schemas, auth
 import random
+import asyncio
 
 # Initialize DB tables
 models.Base.metadata.create_all(bind=database.engine)
@@ -54,6 +56,15 @@ def get_db():
         db.close()
 
 
+def _extract_token(authorization: Optional[str]) -> str:
+    """Извлекает JWT токен из заголовка Authorization: Bearer <token>.
+    Вызывать только после проверки, что значение уже не None и начинается с 'Bearer '.
+    """
+    # Используем partition вместо slice, чтобы избежать ложной ошибки Pyre2
+    # 'Bearer eyJ...' -> partition(' ') -> ('Bearer', ' ', 'eyJ...')
+    return (authorization or "").partition(" ")[2]
+
+
 # --- USERS ---
 @app.get("/users/", response_model=List[schemas.User])
 def read_users(db: Session = Depends(get_db)):
@@ -77,8 +88,8 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
 
 # --- AUTH ---
 @app.post("/auth/send-code")
-def send_code(payload: dict, db: Session = Depends(get_db)):
-    """Отправка SMS-кода. Rate limit: 1 запрос в 60 секунд на номер."""
+async def send_code(payload: dict, db: Session = Depends(get_db)):
+    """Отправка кода через Telegram Bot (или консоль как fallback). Rate limit: 60 сек."""
     phone = payload.get("phone", "").strip()
     if not phone:
         raise HTTPException(status_code=400, detail="Phone number required")
@@ -91,13 +102,23 @@ def send_code(payload: dict, db: Session = Depends(get_db)):
     if not ok:
         raise HTTPException(status_code=429, detail=error_msg)
 
-    # В продакшене: отправить SMS через Twilio/SMS.ru
-    print(f"\n{'='*40}")
-    print(f"📱 SMS ДЛЯ {phone}")
-    print(f"👉 ВАШ КОД БИРГЕ: {code} 👈")
-    print(f"{'='*40}\n")
+    # Пробуем отправить через Telegram Bot
+    chat_id = auth.get_telegram_chat_id(phone, db)
+    tg_sent = False
+    if chat_id:
+        tg_sent = await auth.send_telegram_code(chat_id, code)
 
-    return {"message": "Code sent. Пожалуйста, проверьте SMS (или консоль сервера)."}
+    # Fallback: выводим в консоль (для разработки)
+    if not tg_sent:
+        print(f"\n{'='*40}")
+        print(f"📱 КОД ДЛЯ {phone}")
+        print(f"👉 ВАШ КОД БИРГЕ: {code} 👈")
+        if not chat_id:
+            print(f"⚠️  Telegram не привязан — код только в консоли")
+        print(f"{'='*40}\n")
+
+    channel = "telegram" if tg_sent else "console"
+    return {"message": f"Code sent via {channel}", "tg_linked": bool(chat_id)}
 
 @app.post("/auth/verify-code")
 def verify_code(payload: dict, db: Session = Depends(get_db)):
@@ -130,8 +151,8 @@ def read_current_user(authorization: Optional[str] = Header(None), db: Session =
     """Возвращает профиль текущего пользователя по JWT токену."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
-        
-    token = authorization[7:]
+
+    token = _extract_token(authorization)
     user_id = auth.verify_token(token)
     
     if not user_id:
@@ -149,8 +170,8 @@ def update_current_user(user_update: schemas.UserUpdate, authorization: Optional
     """Обновляет профиль и данные машины текущего пользователя."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
-        
-    token = authorization[7:]
+
+    token = _extract_token(authorization)
     user_id = auth.verify_token(token)
     
     if not user_id:
@@ -173,8 +194,8 @@ def read_current_user_trips(authorization: Optional[str] = Header(None), db: Ses
     """Возвращает историю поездок пользователя."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
-        
-    token = authorization[7:]
+
+    token = _extract_token(authorization)
     user_id = auth.verify_token(token)
     
     if not user_id:
@@ -340,7 +361,7 @@ def find_matches(user_id: int, role: str, origin: str, destination: str, time: s
 
 # --- WEBSOCKET CHAT ---
 from fastapi import WebSocket, WebSocketDisconnect
-from typing import Dict, List
+from typing import Dict
 import json
 from datetime import datetime
 
@@ -359,7 +380,7 @@ class ConnectionManager:
         if trip_id in self.active_connections:
             self.active_connections[trip_id].remove(websocket)
             if not self.active_connections[trip_id]:
-                del self.active_connections[trip_id]
+                self.active_connections.pop(trip_id)
 
     async def broadcast(self, message: str, trip_id: str):
         if trip_id in self.active_connections:
@@ -367,6 +388,83 @@ class ConnectionManager:
                 await connection.send_text(message)
 
 manager = ConnectionManager()
+
+
+# --- SSE MANAGER (мгновенные уведомления пассажиру) ---
+class SSEManager:
+    """Хранит asyncio.Queue для каждого requester_id.
+    Когда водитель принимает запрос — кладём event в очередь,
+    пассажир получает его мгновенно через открытый EventSource.
+    """
+    def __init__(self):
+        self._queues: dict[int, asyncio.Queue] = {}
+
+    def subscribe(self, user_id: int) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._queues[user_id] = q
+        return q
+
+    def unsubscribe(self, user_id: int) -> None:
+        self._queues.pop(user_id, None)
+
+    async def push(self, user_id: int, data: str) -> None:
+        q = self._queues.get(user_id)
+        if q:
+            await q.put(data)
+
+
+sse_manager = SSEManager()
+
+
+@app.get("/trip-requests/events/{requester_id}")
+async def trip_request_events(
+    requester_id: int,
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = None,  # query param для EventSource (не поддерживает кастомные хедеры)
+):
+    """SSE-стрим для пассажира. Открывается на время поиска;
+    когда водитель принимает запрос — пассажир получает event мгновенно.
+    Токен: Authorization header (обычные запросы) ИЛИ ?token= (EventSource).
+    """
+    # Получаем токен из header или query
+    raw_token: str = ""
+    if authorization and authorization.startswith("Bearer "):
+        raw_token = _extract_token(authorization)
+    elif token:
+        raw_token = token
+
+    if not raw_token:
+        return StreamingResponse(
+            iter(["event: error\ndata: unauthorized\n\n"]),
+            media_type="text/event-stream"
+        )
+
+    token_user_id = auth.verify_token(raw_token)
+    if not token_user_id or token_user_id != requester_id:
+        return StreamingResponse(
+            iter(["event: error\ndata: forbidden\n\n"]),
+            media_type="text/event-stream"
+        )
+
+    q = sse_manager.subscribe(requester_id)
+
+    async def event_generator():
+        try:
+            # Keepalive — каждые 20 сек чтобы соединение не обрывалось
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield f"event: request_update\ndata: {data}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            sse_manager.unsubscribe(requester_id)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @app.websocket("/ws/chat/{trip_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, trip_id: str, user_id: int, db: Session = Depends(get_db)):
@@ -433,7 +531,7 @@ def cancel_trip(trip_id: int, authorization: Optional[str] = Header(None), db: S
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    token = authorization[7:]
+    token = _extract_token(authorization)
     user_id = auth.verify_token(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -472,7 +570,8 @@ def create_review(review: schemas.ReviewCreate, db: Session = Depends(get_db)):
     all_reviews = db.query(models.Review).filter(models.Review.user_id == review.user_id).all()
     total_rating = sum(r.rating for r in all_reviews) + review.rating
     count = len(all_reviews) + 1
-    user.trust_rating = round(total_rating / count, 1)
+    # Округляем до 1 знака без round(float, int) — Pyre2 не резолвит этот overload
+    user.trust_rating = int(total_rating * 10 / count) / 10.0
 
     db.commit()
     db.refresh(new_review)
@@ -480,8 +579,6 @@ def create_review(review: schemas.ReviewCreate, db: Session = Depends(get_db)):
 
 
 # --- TRIP REQUESTS (запросы на поездку) ---
-
-from datetime import datetime
 
 @app.post("/trip-requests/")
 def send_trip_request(payload: dict, db: Session = Depends(get_db)):
@@ -549,14 +646,18 @@ def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
 
 
 @app.patch("/trip-requests/{request_id}")
-def respond_to_request(request_id: int, payload: dict, db: Session = Depends(get_db)):
-    """Водитель принимает (accepted) или отклоняет (declined) запрос"""
+async def respond_to_request(request_id: int, payload: dict, db: Session = Depends(get_db)):
+    """Водитель принимает (accepted) или отклоняет (declined) запрос.
+    При accepted — мгновенно уведомляет пассажира через SSE.
+    """
     req = db.query(models.TripRequest).filter(models.TripRequest.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Request not found")
 
     new_status = payload.get("status")  # 'accepted' or 'declined'
     req.status = new_status
+
+    driver = db.query(models.User).filter(models.User.id == req.driver_id).first()
 
     # Если принят — увеличиваем счётчик мест явно
     if new_status == "accepted":
@@ -568,14 +669,27 @@ def respond_to_request(request_id: int, payload: dict, db: Session = Depends(get
                 trip.status = "matched"
 
     db.commit()
-    return {
+
+    response_payload = {
         "id": req.id,
         "status": new_status,
         "trip_id": req.trip_id,
         "requester_trip_id": req.requester_trip_id,
         "requester_id": req.requester_id,
         "driver_id": req.driver_id,
+        "driver_name": driver.name if driver else None,
+        "driver_photo": driver.photo if driver else None,
+        "driver_car_model": driver.car_model if driver else None,
+        "driver_car_plate": driver.car_plate if driver else None,
+        "driver_car_color": driver.car_color if driver else None,
     }
+
+    # Мгновенно уведомляем пассажира через SSE (не ждём polling)
+    if new_status in ("accepted", "declined") and req.requester_id:
+        import json as _json
+        await sse_manager.push(req.requester_id, _json.dumps(response_payload))
+
+    return response_payload
 
 
 @app.get("/trip-requests/status/{requester_id}/{trip_id}")
@@ -635,3 +749,92 @@ def get_trip_passengers(trip_id: int, db: Session = Depends(get_db)):
         "seats_taken": trip.seats_taken or 0,
         "passengers": passengers,
     }
+
+
+# --- TELEGRAM BOT WEBHOOK ---
+@app.post("/bot/webhook")
+async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
+    """
+    Telegram шлёт сюда все входящие сообщения.
+    Пользователь пишет боту свой номер телефона → бот сохраняет phone↔chat_id.
+    Формат: пользователь пишет: "996555123456" или "+996 555 123 456"
+    """
+    message = payload.get("message", {})
+    if not message:
+        return {"ok": True}
+
+    chat_id: int = message.get("chat", {}).get("id")
+    text: str = (message.get("text") or "").strip()
+    first_name: str = message.get("from", {}).get("first_name", "")
+
+    if not chat_id or not text:
+        return {"ok": True}
+
+    # Команда /start — отвечаем приветствием
+    if text.startswith("/start"):
+        await auth.send_telegram_message(
+            chat_id,
+            f"👋 Привет, {first_name}!\n\n"
+            f"Я бот приложения *Birge* — сервиса совместных поездок в Бишкеке 🚗\n\n"
+            f"Чтобы привязать твой номер, отправь его в формате:\n"
+            f"`996XXXXXXXXX`\n\n"
+            f"Например: `996555123456`"
+        )
+        return {"ok": True}
+
+    # Пробуем распарсить номер телефона
+    digits = "".join(filter(str.isdigit, text))
+    if len(digits) >= 10:
+        # Нормализуем к формату "+996 XXX XXX XXX"
+        if digits.startswith("996") and len(digits) == 12:
+            phone = f"+996 {digits[3:6]} {digits[6:9]} {digits[9:12]}"
+        elif digits.startswith("0") and len(digits) == 10:
+            phone = f"+996 {digits[1:4]} {digits[4:7]} {digits[7:10]}"
+        elif len(digits) == 9:
+            phone = f"+996 {digits[0:3]} {digits[3:6]} {digits[6:9]}"
+        else:
+            phone = f"+996 {digits[-9:-6]} {digits[-6:-3]} {digits[-3:]}"
+
+        # Сохраняем или обновляем привязку
+        from models import TelegramBinding
+        binding = db.query(TelegramBinding).filter(TelegramBinding.phone == phone).first()
+        if binding:
+            binding.chat_id = chat_id
+        else:
+            db.add(TelegramBinding(phone=phone, chat_id=chat_id))
+        db.commit()
+
+        await auth.send_telegram_message(
+            chat_id,
+            f"✅ Номер *{phone}* привязан!\n\n"
+            f"Теперь коды для входа в Birge будут приходить сюда 🎉"
+        )
+    else:
+        await auth.send_telegram_message(
+            chat_id,
+            "❓ Не понял. Отправь свой номер телефона, например:\n`996555123456`"
+        )
+
+    return {"ok": True}
+
+
+@app.on_event("startup")
+async def set_telegram_webhook():
+    """Автоматически регистрирует webhook в Telegram при старте сервера."""
+    import os
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not token or not render_url:
+        print("[Telegram] BOT_TOKEN или RENDER_EXTERNAL_URL не заданы — webhook не зарегистрирован")
+        return
+    webhook_url = f"{render_url}/bot/webhook"
+    async with __import__('httpx').AsyncClient() as client:
+        resp = await client.post(
+            f"https://api.telegram.org/bot{token}/setWebhook",
+            json={"url": webhook_url}
+        )
+        result = resp.json()
+        if result.get("ok"):
+            print(f"[Telegram] ✅ Webhook установлен: {webhook_url}")
+        else:
+            print(f"[Telegram] ❌ Ошибка webhook: {result}")

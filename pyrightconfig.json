@@ -1,0 +1,10 @@
+{
+  "include": ["."],
+  "exclude": ["venv", "__pycache__", ".git"],
+  "venvPath": ".",
+  "venv": "venv",
+  "pythonVersion": "3.10",
+  "pythonPath": "./venv/Scripts/python.exe",
+  "extraPaths": ["."],
+  "typeCheckingMode": "basic"
+}

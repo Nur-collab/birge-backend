@@ -1,4 +1,7 @@
+import os
+import httpx
 from datetime import datetime, timedelta
+from typing import Optional
 from jose import JWTError, jwt
 
 # В продакшене — храните секрет в переменной окружения!
@@ -9,6 +12,10 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 дней
 SMS_CODE_TTL_MINUTES = 5        # Код действителен 5 минут
 SMS_RATE_LIMIT_SECONDS = 60     # Повторная отправка — не чаще 1 раза в 60 сек
 
+# Telegram Bot
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -17,7 +24,7 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def verify_token(token: str) -> int | None:
+def verify_token(token: str) -> Optional[int]:
     """Проверяет JWT токен и возвращает user_id."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -25,6 +32,47 @@ def verify_token(token: str) -> int | None:
         return int(user_id_str) if user_id_str else None
     except (JWTError, ValueError):
         return None
+
+
+# ---------- Telegram: найти chat_id по номеру телефона ----------
+
+def get_telegram_chat_id(phone: str, db) -> Optional[int]:
+    """Ищет сохранённый Telegram chat_id для данного номера телефона."""
+    from models import TelegramBinding
+    binding = db.query(TelegramBinding).filter(TelegramBinding.phone == phone).first()
+    return binding.chat_id if binding else None
+
+
+async def send_telegram_code(chat_id: int, code: str) -> bool:
+    """Отправляет код верификации через Telegram Bot."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    message = (
+        f"🔐 *Ваш код для входа в Birge:*\n\n"
+        f"➡️ `{code}`\n\n"
+        f"_Код действителен 5 минут. Не передавайте его никому._"
+    )
+    return await send_telegram_message(chat_id, message)
+
+
+async def send_telegram_message(chat_id: int, text: str) -> bool:
+    """Отправляет любое сообщение через Telegram Bot."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{TELEGRAM_API_URL}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                },
+            )
+            return resp.status_code == 200 and resp.json().get("ok", False)
+    except Exception as e:
+        print(f"[Telegram] Ошибка отправки: {e}")
+        return False
 
 
 # ---------- SMS через БД ----------
@@ -90,3 +138,4 @@ def verify_sms_code(phone: str, code: str, db) -> bool:
     entry.is_used = True
     db.commit()
     return True
+

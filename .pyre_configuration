@@ -1,0 +1,10 @@
+{
+  "source_directories": ["."],
+  "venv": "venv",
+  "venv_root": ".",
+  "search_path": [
+    ".",
+    "venv/Lib/site-packages"
+  ],
+  "exclude": ["/\\.git", "/__pycache__", "/venv"]
+}
