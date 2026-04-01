@@ -37,10 +37,19 @@ def verify_token(token: str) -> Optional[int]:
 # ---------- Telegram: найти chat_id по номеру телефона ----------
 
 def get_telegram_chat_id(phone: str, db) -> Optional[int]:
-    """Ищет сохранённый Telegram chat_id для данного номера телефона."""
+    """Ищет сохранённый Telegram chat_id для данного номера телефона.
+    Нормализует номер (убирает пробелы) перед сравнением.
+    """
     from models import TelegramBinding
-    binding = db.query(TelegramBinding).filter(TelegramBinding.phone == phone).first()
-    return binding.chat_id if binding else None
+    # Нормализуем входящий номер — убираем все пробелы
+    phone_digits = "".join(filter(str.isdigit, phone))
+    # Загружаем все привязки и ищем совпадение по цифрам
+    bindings = db.query(TelegramBinding).all()
+    for binding in bindings:
+        binding_digits = "".join(filter(str.isdigit, binding.phone))
+        if binding_digits == phone_digits:
+            return binding.chat_id
+    return None
 
 
 async def send_telegram_code(chat_id: int, code: str) -> bool:
