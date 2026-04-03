@@ -230,8 +230,17 @@ def create_trip(trip: schemas.TripCreate, db: Session = Depends(get_db)):
         user.trips_today += 1
 
     db.commit()
-    
-    new_trip = models.Trip(**trip.model_dump())
+
+    trip_data = trip.model_dump()
+
+    # Если дата поездки в будущем — ставим статус 'scheduled', иначе 'active'
+    trip_date = trip_data.get("date")
+    if trip_date and trip_date > today_str:
+        trip_data["status"] = "scheduled"
+    else:
+        trip_data["status"] = "active"
+
+    new_trip = models.Trip(**trip_data)
     db.add(new_trip)
     db.commit()
     db.refresh(new_trip)
@@ -332,16 +341,17 @@ def find_matches(user_id: int, role: str, origin: str, destination: str, time: s
     target_role = "passenger" if role == "driver" else "driver"
     
     from sqlalchemy.orm import joinedload
-    
+    from sqlalchemy import or_ as _or
+
+    # Показываем как 'active', так и 'scheduled' поездки
     trip_query = db.query(models.Trip).options(joinedload(models.Trip.user)).filter(
         models.Trip.role == target_role,
-        models.Trip.status == "active",
+        _or(models.Trip.status == "active", models.Trip.status == "scheduled"),
         models.Trip.user_id != user_id
     )
 
     # Фильтр по дате: если дата передана — показываем только её (+ legacy записи без даты)
     if date:
-        from sqlalchemy import or_ as _or
         trip_query = trip_query.filter(
             _or(models.Trip.date == date, models.Trip.date == None)
         )
