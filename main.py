@@ -16,6 +16,7 @@ def run_migrations():
         migrations = [
             "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats INTEGER DEFAULT 3",
             "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats_taken INTEGER DEFAULT 0",
+            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
         ]
         for sql in migrations:
             try:
@@ -237,7 +238,7 @@ def create_trip(trip: schemas.TripCreate, db: Session = Depends(get_db)):
     return new_trip
 
 @app.get("/trips/matches", response_model=List[schemas.Trip])
-def find_matches(user_id: int, role: str, origin: str, destination: str, time: str, db: Session = Depends(get_db)):
+def find_matches(user_id: int, role: str, origin: str, destination: str, time: str, date: Optional[str] = None, db: Session = Depends(get_db)):
     """
     Улучшенный алгоритм поиска попутчиков:
     1. Haversine-расстояние по геокоординатам (радиус 2км)
@@ -332,11 +333,20 @@ def find_matches(user_id: int, role: str, origin: str, destination: str, time: s
     
     from sqlalchemy.orm import joinedload
     
-    potential_trips = db.query(models.Trip).options(joinedload(models.Trip.user)).filter(
+    trip_query = db.query(models.Trip).options(joinedload(models.Trip.user)).filter(
         models.Trip.role == target_role,
         models.Trip.status == "active",
         models.Trip.user_id != user_id
-    ).all()
+    )
+
+    # Фильтр по дате: если дата передана — показываем только её (+ legacy записи без даты)
+    if date:
+        from sqlalchemy import or_ as _or
+        trip_query = trip_query.filter(
+            _or(models.Trip.date == date, models.Trip.date == None)
+        )
+
+    potential_trips = trip_query.all()
 
     matches = []
     for trip in potential_trips:

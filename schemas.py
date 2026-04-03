@@ -52,7 +52,8 @@ class TripBase(BaseModel):
     origin: str
     destination: str
     time: str
-    seats: int = 3  # макс мест (для водителя)
+    date: Optional[str] = None  # 'YYYY-MM-DD', None = без привязки к дате
+    seats: int = 3              # макс мест (для водителя)
 
 class TripCreate(TripBase):
     user_id: int

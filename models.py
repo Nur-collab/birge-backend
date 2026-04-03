@@ -33,6 +33,7 @@ class Trip(Base):
     destination = Column(String)
     time = Column(String)
     status = Column(String, default="active") # active, matched, completed
+    date = Column(String)                      # 'YYYY-MM-DD' дата поездки (опц.)
     seats = Column(Integer, default=3)        # макс мест (для водителя)
     seats_taken = Column(Integer, default=0)  # занято мест
 
