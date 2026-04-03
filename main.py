@@ -207,7 +207,104 @@ def read_current_user_trips(authorization: Optional[str] = Header(None), db: Ses
     trips = db.query(models.Trip).filter(models.Trip.user_id == user_id).order_by(models.Trip.id.desc()).all()
     return trips
 
-# --- TRIPS ---
+@app.get("/users/me/scheduled-trips")
+def read_scheduled_trips(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """Возвращает запланированные поездки пользователя (и как водителя, и как пассажира)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = _extract_token(authorization)
+    user_id = auth.verify_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    import datetime
+    today_str = datetime.date.today().isoformat()
+
+    result = []
+
+    # 1. Поездки где пользователь — ВОДИТЕЛЬ (его Trip со статусом scheduled)
+    driver_trips = db.query(models.Trip).filter(
+        models.Trip.user_id == user_id,
+        models.Trip.role == "driver",
+        models.Trip.status == "scheduled",
+        models.Trip.date > today_str
+    ).order_by(models.Trip.date, models.Trip.time).all()
+
+    for trip in driver_trips:
+        # Собираем список принятых пассажиров
+        accepted_reqs = db.query(models.TripRequest).filter(
+            models.TripRequest.trip_id == trip.id,
+            models.TripRequest.status == "accepted"
+        ).all()
+        passengers = []
+        for r in accepted_reqs:
+            passenger_user = db.query(models.User).filter(models.User.id == r.requester_id).first()
+            if passenger_user:
+                passengers.append({
+                    "id": passenger_user.id,
+                    "name": passenger_user.name,
+                    "photo": passenger_user.photo,
+                    "trust_rating": passenger_user.trust_rating,
+                    "is_verified": passenger_user.is_verified,
+                    "request_id": r.id,
+                })
+        result.append({
+            "trip_id": trip.id,
+            "role": "driver",
+            "origin": trip.origin,
+            "destination": trip.destination,
+            "date": trip.date,
+            "time": trip.time,
+            "seats": trip.seats or 3,
+            "seats_taken": trip.seats_taken or 0,
+            "passengers": passengers,
+            "driver": None,
+        })
+
+    # 2. Поездки где пользователь — ПАССАЖИР (принятые TripRequest для будущих поездок)
+    accepted_requests = db.query(models.TripRequest).filter(
+        models.TripRequest.requester_id == user_id,
+        models.TripRequest.status == "accepted"
+    ).all()
+
+    for req in accepted_requests:
+        driver_trip = db.query(models.Trip).filter(models.Trip.id == req.trip_id).first()
+        if not driver_trip:
+            continue
+        # Только будущие поездки
+        trip_date = driver_trip.date or ""
+        if not trip_date or trip_date <= today_str:
+            continue
+        driver_user = db.query(models.User).filter(models.User.id == req.driver_id).first()
+        result.append({
+            "trip_id": req.trip_id,
+            "requester_trip_id": req.requester_trip_id,
+            "role": "passenger",
+            "origin": driver_trip.origin,
+            "destination": driver_trip.destination,
+            "date": driver_trip.date,
+            "time": driver_trip.time,
+            "seats": driver_trip.seats or 3,
+            "seats_taken": driver_trip.seats_taken or 0,
+            "passengers": [],
+            "driver": {
+                "id": driver_user.id if driver_user else None,
+                "name": driver_user.name if driver_user else "Водитель",
+                "photo": driver_user.photo if driver_user else "",
+                "trust_rating": driver_user.trust_rating if driver_user else 5.0,
+                "is_verified": driver_user.is_verified if driver_user else False,
+                "car_model": driver_user.car_model if driver_user else None,
+                "car_color": driver_user.car_color if driver_user else None,
+                "car_plate": driver_user.car_plate if driver_user else None,
+            } if driver_user else None,
+        })
+
+    # Сортируем итоговый список по дате
+    result.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
+    return result
+
+
 @app.post("/trips/", response_model=schemas.Trip)
 def create_trip(trip: schemas.TripCreate, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == trip.user_id).first()
