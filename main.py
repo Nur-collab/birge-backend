@@ -17,6 +17,7 @@ def run_migrations():
             "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats INTEGER DEFAULT 3",
             "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats_taken INTEGER DEFAULT 0",
             "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
+            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
         ]
         for sql in migrations:
             try:
@@ -655,6 +656,8 @@ def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
             "origin": driver_trip.origin if driver_trip else "",
             "destination": driver_trip.destination if driver_trip else "",
             "time": driver_trip.time if driver_trip else "",
+            "date": driver_trip.date if driver_trip else "",
+            "date": driver_trip.date if driver_trip else "",
             "status": r.status,
             "created_at": r.created_at,
             # Данные машины водителя
