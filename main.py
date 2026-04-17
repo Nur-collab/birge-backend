@@ -12,19 +12,30 @@ models.Base.metadata.create_all(bind=database.engine)
 
 # Миграция: добавляем новые колонки если их нет (для существующих баз)
 def run_migrations():
+    """Безопасная миграция — работает и в SQLite и в PostgreSQL."""
+    is_sqlite = str(database.engine.url).startswith("sqlite")
     with database.engine.connect() as conn:
-        migrations = [
-            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats INTEGER DEFAULT 3",
-            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats_taken INTEGER DEFAULT 0",
-            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
-            "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
-        ]
+        if is_sqlite:
+            # SQLite не поддерживает IF NOT EXISTS для ALTER TABLE
+            migrations = [
+                "ALTER TABLE trips ADD COLUMN seats INTEGER DEFAULT 3",
+                "ALTER TABLE trips ADD COLUMN seats_taken INTEGER DEFAULT 0",
+                "ALTER TABLE trips ADD COLUMN date TEXT",
+            ]
+        else:
+            # PostgreSQL поддерживает IF NOT EXISTS
+            migrations = [
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats INTEGER DEFAULT 3",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats_taken INTEGER DEFAULT 0",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
+            ]
         for sql in migrations:
             try:
                 conn.execute(database.text(sql))
+                conn.commit()
             except Exception:
+                # Колонка уже существует — игнорируем
                 pass
-        conn.commit()
 
 try:
     from sqlalchemy import text as _text
@@ -531,7 +542,58 @@ class SSEManager:
             await q.put(data)
 
 
-sse_manager = SSEManager()
+sse_manager = SSEManager()       # passenger: receives accept/decline events
+driver_sse_manager = SSEManager() # driver: receives new trip-request events
+
+
+@app.get("/trip-requests/driver-events/{driver_id}")
+async def driver_trip_request_events(
+    driver_id: int,
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = None,
+):
+    """SSE-стрим для водителя.
+    Открывается пока водитель в поиске или в активной поездке;
+    при каждом новом запросе от пассажира водитель получает event мгновенно.
+    Токен: Authorization header ИЛИ ?token= (EventSource не поддерживает хедеры).
+    """
+    raw_token: str = ""
+    if authorization and authorization.startswith("Bearer "):
+        raw_token = _extract_token(authorization)
+    elif token:
+        raw_token = token
+
+    if not raw_token:
+        return StreamingResponse(
+            iter(["event: error\ndata: unauthorized\n\n"]),
+            media_type="text/event-stream",
+        )
+
+    token_user_id = auth.verify_token(raw_token)
+    if not token_user_id or token_user_id != driver_id:
+        return StreamingResponse(
+            iter(["event: error\ndata: forbidden\n\n"]),
+            media_type="text/event-stream",
+        )
+
+    q = driver_sse_manager.subscribe(driver_id)
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield f"event: new_request\ndata: {data}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            driver_sse_manager.unsubscribe(driver_id)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/trip-requests/events/{requester_id}")
@@ -699,18 +761,20 @@ def create_review(review: schemas.ReviewCreate, db: Session = Depends(get_db)):
 # --- TRIP REQUESTS (запросы на поездку) ---
 
 @app.post("/trip-requests/")
-def send_trip_request(payload: dict, db: Session = Depends(get_db)):
-    """Пассажир отправляет запрос водителю на поездку"""
-    trip_id = payload.get("trip_id")          # ID поездки водителя
-    requester_trip_id = payload.get("requester_trip_id")  # ID поездки пассажира
-    requester_id = payload.get("requester_id")  # ID пассажира
-    driver_id = payload.get("driver_id")       # ID водителя
+async def send_trip_request(payload: dict, db: Session = Depends(get_db)):
+    """Пассажир отправляет запрос водителю на поездку.
+    После сохранения в БД немедленно уведомляет водителя через SSE.
+    """
+    trip_id = payload.get("trip_id")                     # ID поездки водителя
+    requester_trip_id = payload.get("requester_trip_id") # ID поездки пассажира
+    requester_id = payload.get("requester_id")           # ID пассажира
+    driver_id = payload.get("driver_id")                 # ID водителя
 
-    # Проверяем не отправлял ли уже
+    # Проверяем, не отправлял ли уже
     existing = db.query(models.TripRequest).filter(
         models.TripRequest.trip_id == trip_id,
         models.TripRequest.requester_id == requester_id,
-        models.TripRequest.status == "pending"
+        models.TripRequest.status == "pending",
     ).first()
     if existing:
         return {"id": existing.id, "status": "pending", "message": "Already sent"}
@@ -721,11 +785,37 @@ def send_trip_request(payload: dict, db: Session = Depends(get_db)):
         requester_id=requester_id,
         driver_id=driver_id,
         status="pending",
-        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
     db.add(req)
     db.commit()
     db.refresh(req)
+
+    # Собираем данные пассажира для SSE-пуша водителю
+    requester = db.query(models.User).filter(models.User.id == requester_id).first()
+    driver_trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
+
+    sse_payload = {
+        "id": req.id,
+        "trip_id": trip_id,
+        "requester_trip_id": requester_trip_id,
+        "requester_id": requester_id,
+        "driver_id": driver_id,
+        "status": "pending",
+        "requester_name": requester.name if requester else "Пассажир",
+        "requester_photo": requester.photo if requester else "",
+        "requester_rating": requester.trust_rating if requester else 5.0,
+        "origin": driver_trip.origin if driver_trip else "",
+        "destination": driver_trip.destination if driver_trip else "",
+        "time": driver_trip.time if driver_trip else "",
+        "date": driver_trip.date if driver_trip else "",
+    }
+
+    # Мгновенно уведомляем водителя через SSE (если он подписан)
+    if driver_id:
+        import json as _json
+        await driver_sse_manager.push(driver_id, _json.dumps(sse_payload))
+
     return {"id": req.id, "status": "pending"}
 
 
