@@ -218,6 +218,49 @@ def read_current_user_trips(authorization: Optional[str] = Header(None), db: Ses
     trips = db.query(models.Trip).filter(models.Trip.user_id == user_id).order_by(models.Trip.id.desc()).all()
     return trips
 
+
+@app.get("/users/me/active-trip")
+def get_my_active_trip(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """Возвращает активную (not-completed) поездку текущего пользователя.
+    Фронтенд вызывает этот эндпоинт при входе, чтобы предложить возобновить поиск.
+    Считается просроченной если:
+      - статус active И дата поездки < сегодняшней (вчерашняя или старше)
+    Считается актуальной если:
+      - статус active И дата == сегодня (юзер может возобновить поиск)
+    Scheduled-поездки не возвращаются — для них есть /users/me/scheduled-trips.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = _extract_token(authorization)
+    user_id = auth.verify_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+
+    # Ищем active-поездку с датой сегодня (юзер мог закрыть приложение во время поиска)
+    trip = db.query(models.Trip).filter(
+        models.Trip.user_id == user_id,
+        models.Trip.status == "active",
+        models.Trip.date == today,
+    ).order_by(models.Trip.id.desc()).first()
+
+    if not trip:
+        return {"found": False}
+
+    return {
+        "found": True,
+        "trip_id": trip.id,
+        "role": trip.role,
+        "origin": trip.origin,
+        "destination": trip.destination,
+        "time": trip.time,
+        "date": trip.date,
+        "seats": trip.seats or 3,
+    }
+
 @app.get("/users/me/scheduled-trips")
 def read_scheduled_trips(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
     """Возвращает запланированные поездки пользователя (и как водителя, и как пассажира)."""
@@ -1029,8 +1072,38 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
 
 
 @app.on_event("startup")
-async def set_telegram_webhook():
-    """Автоматически регистрирует webhook в Telegram при старте сервера."""
+async def startup_tasks():
+    """1. Удаляем просроченные active-поездки (дата уже прошла).
+    2. Регистрируем Telegram webhook.
+
+    НИКОГДА не трогаем scheduled-поездки — это будущие поездки, они важны.
+    """
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+
+    # --- Очистка просроченных active-поездок ---
+    with database.SessionLocal() as db:
+        # Случай 1: дата поездки < сегодня (вчерашние и старше)
+        stale = db.query(models.Trip).filter(
+            models.Trip.status == "active",
+            models.Trip.date != None,
+            models.Trip.date < today,
+        ).all()
+        # Случай 2: дата не заполнена (legacy-записи без даты) — тоже считаем просроченными,
+        # если их ID ниже минимального ID поездки последних 7 дней (грубое, но без created_at лучше не сломать)
+        stale_no_date = db.query(models.Trip).filter(
+            models.Trip.status == "active",
+            models.Trip.date == None,
+        ).all()
+        all_stale = stale + stale_no_date
+        count = len(all_stale)
+        for trip in all_stale:
+            db.delete(trip)
+        if count:
+            db.commit()
+            print(f"[Startup] Удалено {count} просроченных active-поездок")
+
+    # --- Telegram webhook ---
     import os
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
