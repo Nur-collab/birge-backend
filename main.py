@@ -21,6 +21,7 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN seats INTEGER DEFAULT 3",
                 "ALTER TABLE trips ADD COLUMN seats_taken INTEGER DEFAULT 0",
                 "ALTER TABLE trips ADD COLUMN date TEXT",
+                "ALTER TABLE trips ADD COLUMN price_per_seat INTEGER DEFAULT 0",
             ]
         else:
             # PostgreSQL поддерживает IF NOT EXISTS
@@ -28,6 +29,7 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats INTEGER DEFAULT 3",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats_taken INTEGER DEFAULT 0",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS price_per_seat INTEGER DEFAULT 0",
             ]
         for sql in migrations:
             try:
