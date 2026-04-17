@@ -263,9 +263,67 @@ def get_my_active_trip(authorization: Optional[str] = Header(None), db: Session 
         "seats": trip.seats or 3,
     }
 
+@app.post("/users/me/verify")
+async def verify_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """Верификация аккаунта через Telegram.
+
+    Если пользователь уже привязал Telegram (есть TelegramBinding) — сразу ставим is_verified=True.
+    Если нет — возвращаем инструкцию со ссылкой на бота.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = _extract_token(authorization)
+    user_id = auth.verify_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Уже верифицирован?
+    if user.is_verified:
+        return {"status": "already_verified"}
+
+    # Проверяем наличие Telegram-привязки
+    chat_id = auth.get_telegram_chat_id(user.phone, db)
+
+    if chat_id:
+        # Telegram привязан — верифицируем сразу
+        user.is_verified = True
+        db.commit()
+        db.refresh(user)
+
+        # Отправляем поздравление в Telegram
+        msg = (
+            f"✅ *Аккаунт верифицирован!*\n\n"
+            f"Привет, {user.name}! Твой аккаунт Birge теперь имеет значок ✅ на профиле.\n"
+            f"Другие пользователи будут точно знать, что ты настоящий \u2014 это повышает доверие 🙏"
+        )
+        await auth.send_telegram_message(chat_id, msg)
+        return {"status": "verified", "message": "Аккаунт успешно верифицирован"}
+    else:
+        # Telegram не привязан — возвращаем инструкцию
+        import os
+        bot_username = os.environ.get("TELEGRAM_BOT_USERNAME", "BirgeBot")
+        # Форматируем номер для deep-link (убираем '+' и пробелы)
+        phone_clean = "".join(filter(str.isdigit, user.phone))
+        bot_url = f"https://t.me/{bot_username}?start={phone_clean}"
+        return {
+            "status": "need_telegram",
+            "bot_url": bot_url,
+            "message": (
+                "Откройте Telegram-бота, "
+                "отправьте /start и запустите верификацию снова"
+            )
+        }
+
+
 @app.get("/users/me/scheduled-trips")
 def read_scheduled_trips(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
     """Возвращает запланированные поездки пользователя (и как водителя, и как пассажира)."""
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -1073,10 +1131,106 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+# Множество trip_id для которых уже отправлено напоминание (в текущей сессии сервера)
+_reminded_trips: set[int] = set()
+
+
+async def _reminder_loop():
+    """Background loop: каждую минуту проверяет запланированные поездки.
+    Если до начала поездки осталось 50-70 минут — отправляем Telegram-напоминание
+    водителю И всем принятым пассажирам.
+    """
+    import datetime as _dt
+    from models import TelegramBinding
+
+    while True:
+        await asyncio.sleep(60)  # проверяем раз в минуту
+        try:
+            now = _dt.datetime.now()
+            today = now.date().isoformat()
+
+            # Окно проверки: от 50 до 70 минут до начала поездки
+            window_from = (now + _dt.timedelta(minutes=50)).strftime("%H:%M")
+            window_to   = (now + _dt.timedelta(minutes=70)).strftime("%H:%M")
+
+            with database.SessionLocal() as db:
+                # Запланированные поездки на сегодня в нужном окне времени
+                trips = db.query(models.Trip).filter(
+                    models.Trip.status == "scheduled",
+                    models.Trip.date == today,
+                    models.Trip.time >= window_from,
+                    models.Trip.time <= window_to,
+                ).all()
+
+                for trip in trips:
+                    if trip.id in _reminded_trips:
+                        continue  # уже отправляли в этой сессии
+
+                    # --- Напоминаем ВОДИТЕЛЯ ---
+                    driver_user = db.query(models.User).filter(models.User.id == trip.user_id).first()
+                    if driver_user:
+                        driver_chat_id = auth.get_telegram_chat_id(driver_user.phone, db)
+                        if driver_chat_id:
+                            msg = (
+                                f"🚗 *Напоминание о поездке!*\n\n"
+                                f"До отправления остался примерно *час*.\n"
+                                f"↘️ {trip.origin}\n"
+                                f"↗️ {trip.destination}\n"
+                                f"🕕 {trip.time} — {trip.date}\n\n"
+                                f"Роль: *Водитель* 🚘"
+                            )
+                            await auth.send_telegram_message(driver_chat_id, msg)
+                            print(f"[Reminder] Водитель trip#{trip.id} → chat {driver_chat_id}")
+
+                    # --- Напоминаем всех ПРИНЯТЫХ ПАССАЖИРОВ ---
+                    accepted = db.query(models.TripRequest).filter(
+                        models.TripRequest.trip_id == trip.id,
+                        models.TripRequest.status == "accepted",
+                    ).all()
+
+                    for req in accepted:
+                        passenger = db.query(models.User).filter(models.User.id == req.requester_id).first()
+                        if not passenger:
+                            continue
+                        passenger_chat_id = auth.get_telegram_chat_id(passenger.phone, db)
+                        if not passenger_chat_id:
+                            continue
+
+                        car_info = ""
+                        if driver_user and driver_user.car_model:
+                            car_info = f"🚙 {driver_user.car_model}"
+                            if driver_user.car_color:
+                                car_info += f" · {driver_user.car_color}"
+                            if driver_user.car_plate:
+                                car_info += f" `{driver_user.car_plate}`"
+                            car_info = f"\n{car_info}"
+
+                        msg = (
+                            f"🚗 *Напоминание о поездке!*\n\n"
+                            f"До отправления остался примерно *час*.\n"
+                            f"↘️ {trip.origin}\n"
+                            f"↗️ {trip.destination}\n"
+                            f"🕕 {trip.time} — {trip.date}\n"
+                            f"👤 Водитель: *{driver_user.name if driver_user else 'Неизвестно'}*"
+                            f"{car_info}\n\n"
+                            f"Роль: *Пассажир* 🤺"
+                        )
+                        await auth.send_telegram_message(passenger_chat_id, msg)
+                        print(f"[Reminder] Пассажир uid={passenger.id} trip#{trip.id} → chat {passenger_chat_id}")
+
+                    # Отмечаем как отправленное
+                    _reminded_trips.add(trip.id)
+
+        except Exception as e:
+            # Не даём задаче упасть — продолжаем циклить
+            print(f"[Reminder] Ошибка в цикле: {e}")
+
+
 @app.on_event("startup")
 async def startup_tasks():
     """1. Удаляем просроченные active-поездки (дата уже прошла).
     2. Регистрируем Telegram webhook.
+    3. Запускаем фоновую задачу напоминаний за 1 час до поездки.
 
     НИКОГДА не трогаем scheduled-поездки — это будущие поездки, они важны.
     """
@@ -1104,6 +1258,10 @@ async def startup_tasks():
         if count:
             db.commit()
             print(f"[Startup] Удалено {count} просроченных active-поездок")
+
+    # --- Запуск фоновой задачи напоминаний ---
+    asyncio.create_task(_reminder_loop())
+    print("[Reminder] ✅ Фоновая задача напоминаний запущена (проверка каждые 60 сек)")
 
     # --- Telegram webhook ---
     import os
