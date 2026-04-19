@@ -1,11 +1,24 @@
 import os
+import secrets
 import httpx
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
 
-# В продакшене — храните секрет в переменной окружения!
-SECRET_KEY = "birge-super-secret-key-bishkek-2024"
+# Берём секрет из переменной окружения.
+# На Render: Settings → Environment → Add SECRET_KEY
+_env_secret = os.environ.get("SECRET_KEY", "")
+if not _env_secret:
+    # Генерируем случайный ключ как временный fallback (сессии не переживут рестарт).
+    # Это нормально для разработки, но недопустимо в продакшене.
+    _env_secret = secrets.token_hex(32)
+    print(
+        "[Auth] ⚠️  Переменная окружения SECRET_KEY не задана. "
+        "JWT-токены будут сбрасываться при каждом рестарте сервера. "
+        "Задайте SECRET_KEY в настройках Render."
+    )
+
+SECRET_KEY: str = _env_secret
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 дней
 

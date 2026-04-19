@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -78,6 +78,50 @@ def _extract_token(authorization: Optional[str]) -> str:
     # Используем partition вместо slice, чтобы избежать ложной ошибки Pyre2
     # 'Bearer eyJ...' -> partition(' ') -> ('Bearer', ' ', 'eyJ...')
     return (authorization or "").partition(" ")[2]
+
+
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),  # для SSE (EventSource не шлёт заголовки)
+    db: Session = Depends(get_db),
+) -> models.User:
+    """Возвращает текущего пользователя по JWT-токену.
+
+    Принимает токениз:
+      - `Authorization: Bearer <token>` заголовок (стандартные запросы)
+      - `?token=<token>` query-параметр (SSE/EventSource, не поддерживает кастомные заголовки)
+    """
+    # 1. Извлекаем сырой токен
+    raw_token: Optional[str] = None
+    if authorization and authorization.startswith("Bearer "):
+        raw_token = _extract_token(authorization)
+    elif token:
+        raw_token = token
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 2. Проверяем подпись
+    user_id = auth.verify_token(raw_token)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 3. Загружаем пользователя
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+    return user
 
 
 # --- USERS ---
@@ -162,92 +206,61 @@ def verify_code(payload: dict, db: Session = Depends(get_db)):
     return {"access_token": token, "token_type": "bearer", "user_id": user.id}
 
 @app.get("/users/me", response_model=schemas.User)
-def read_current_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+def read_current_user(
+    current_user: models.User = Depends(get_current_user),
+):
     """Возвращает профиль текущего пользователя по JWT токену."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = _extract_token(authorization)
-    user_id = auth.verify_token(token)
-    
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-        
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-        
-    return user
+    return current_user
 
 @app.patch("/users/me", response_model=schemas.User)
-def update_current_user(user_update: schemas.UserUpdate, authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+def update_current_user(
+    user_update: schemas.UserUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Обновляет профиль и данные машины текущего пользователя."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = _extract_token(authorization)
-    user_id = auth.verify_token(token)
-    
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-        
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-        
     update_data = user_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
-        setattr(user, key, value)
-        
+        setattr(current_user, key, value)
     db.commit()
-    db.refresh(user)
-    return user
+    db.refresh(current_user)
+    return current_user
+
 
 @app.get("/users/me/trips", response_model=List[schemas.Trip])
-def read_current_user_trips(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+def read_current_user_trips(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Возвращает историю поездок пользователя."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = _extract_token(authorization)
-    user_id = auth.verify_token(token)
-    
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-        
-    # Возвращаем поездки (только завершенные или заматченные можно оставить, но пока все)
-    trips = db.query(models.Trip).filter(models.Trip.user_id == user_id).order_by(models.Trip.id.desc()).all()
-    return trips
+    return (
+        db.query(models.Trip)
+        .filter(models.Trip.user_id == current_user.id)
+        .order_by(models.Trip.id.desc())
+        .all()
+    )
 
 
 @app.get("/users/me/active-trip")
-def get_my_active_trip(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
-    """Возвращает активную (not-completed) поездку текущего пользователя.
-    Фронтенд вызывает этот эндпоинт при входе, чтобы предложить возобновить поиск.
-    Считается просроченной если:
-      - статус active И дата поездки < сегодняшней (вчерашняя или старше)
-    Считается актуальной если:
-      - статус active И дата == сегодня (юзер может возобновить поиск)
-    Scheduled-поездки не возвращаются — для них есть /users/me/scheduled-trips.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = _extract_token(authorization)
-    user_id = auth.verify_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
+def get_my_active_trip(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Возвращает active-поездку с датой сегодня, если такая есть.
+    Фронтенд вызывает при входе чтобы предложить возобновить поиск."""
     import datetime as _dt
     today = _dt.date.today().isoformat()
 
-    # Ищем active-поездку с датой сегодня (юзер мог закрыть приложение во время поиска)
-    trip = db.query(models.Trip).filter(
-        models.Trip.user_id == user_id,
-        models.Trip.status == "active",
-        models.Trip.date == today,
-    ).order_by(models.Trip.id.desc()).first()
+    trip = (
+        db.query(models.Trip)
+        .filter(
+            models.Trip.user_id == current_user.id,
+            models.Trip.status == "active",
+            models.Trip.date == today,
+        )
+        .order_by(models.Trip.id.desc())
+        .first()
+    )
 
     if not trip:
         return {"found": False}
@@ -264,42 +277,26 @@ def get_my_active_trip(authorization: Optional[str] = Header(None), db: Session 
     }
 
 @app.post("/users/me/verify")
-async def verify_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+async def verify_user(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Верификация аккаунта через Telegram.
-
-    Если пользователь уже привязал Telegram (есть TelegramBinding) — сразу ставим is_verified=True.
-    Если нет — возвращаем инструкцию со ссылкой на бота.
+    Если TelegramBinding есть — ставим is_verified=True сразу.
+    Если нет — возвращаем ссылку на бота.
     """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = _extract_token(authorization)
-    user_id = auth.verify_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Уже верифицирован?
-    if user.is_verified:
+    if current_user.is_verified:
         return {"status": "already_verified"}
 
-    # Проверяем наличие Telegram-привязки
-    chat_id = auth.get_telegram_chat_id(user.phone, db)
-
+    chat_id = auth.get_telegram_chat_id(current_user.phone, db)
     if chat_id:
-        # Telegram привязан — верифицируем сразу
-        user.is_verified = True
+        current_user.is_verified = True
         db.commit()
-        db.refresh(user)
-
-        # Отправляем поздравление в Telegram
+        db.refresh(current_user)
         msg = (
             f"✅ *Аккаунт верифицирован!*\n\n"
-            f"Привет, {user.name}! Твой аккаунт Birge теперь имеет значок ✅ на профиле.\n"
-            f"Другие пользователи будут точно знать, что ты настоящий \u2014 это повышает доверие 🙏"
+            f"Привет, {current_user.name}! Твой аккаунт Birge теперь имеет значок ✅ на профиле.\n"
+            f"Другие пользователи будут точно знать, что ты настоящий — это повышает доверие 🙏"
         )
         await auth.send_telegram_message(chat_id, msg)
         return {"status": "verified", "message": "Аккаунт успешно верифицирован"}
@@ -308,7 +305,7 @@ async def verify_user(authorization: Optional[str] = Header(None), db: Session =
         import os
         bot_username = os.environ.get("TELEGRAM_BOT_USERNAME", "BirgeBot")
         # Форматируем номер для deep-link (убираем '+' и пробелы)
-        phone_clean = "".join(filter(str.isdigit, user.phone))
+        phone_clean = "".join(filter(str.isdigit, current_user.phone))
         bot_url = f"https://t.me/{bot_username}?start={phone_clean}"
         return {
             "status": "need_telegram",
@@ -321,19 +318,14 @@ async def verify_user(authorization: Optional[str] = Header(None), db: Session =
 
 
 @app.get("/users/me/scheduled-trips")
-def read_scheduled_trips(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+def read_scheduled_trips(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Возвращает запланированные поездки пользователя (и как водителя, и как пассажира)."""
-
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = _extract_token(authorization)
-    user_id = auth.verify_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
     import datetime
     today_str = datetime.date.today().isoformat()
+    user_id = current_user.id
 
     result = []
 
@@ -947,7 +939,6 @@ def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
             "destination": driver_trip.destination if driver_trip else "",
             "time": driver_trip.time if driver_trip else "",
             "date": driver_trip.date if driver_trip else "",
-            "date": driver_trip.date if driver_trip else "",
             "status": r.status,
             "created_at": r.created_at,
             # Данные машины водителя
@@ -1283,19 +1274,4 @@ async def startup_tasks():
             print(f"[Telegram] ❌ Ошибка webhook: {result}")
 
 
-# --- DEBUG: проверка привязок Telegram (временный эндпоинт) ---
-@app.get("/debug/telegram-bindings")
-def debug_telegram_bindings(db: Session = Depends(get_db)):
-    """Показывает все записи TelegramBinding в БД. Удалить после отладки."""
-    from models import TelegramBinding
-    bindings = db.query(TelegramBinding).all()
-    return [
-        {
-            "id": b.id,
-            "phone": b.phone,
-            "phone_digits": "".join(filter(str.isdigit, b.phone)),
-            "chat_id": b.chat_id,
-            "created_at": str(b.created_at),
-        }
-        for b in bindings
-    ]
+# debug/telegram-bindings endpoint removed — данные пользователей не должны быть публичными.
