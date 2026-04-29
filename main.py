@@ -48,6 +48,11 @@ except Exception as e:
 
 app = FastAPI(title="Birge API - MVP Backend")
 
+@app.get("/health")
+def health_check():
+    """Публичный эндпоинт для мониторинга (UptimeRobot, etc.). Без авторизации."""
+    return {"status": "ok"}
+
 # Разрешаем запросы с нашего React приложения (CORS)
 app.add_middleware(
     CORSMiddleware,
@@ -819,7 +824,60 @@ def cancel_trip(
     return {"id": trip_id, "deleted": True}
 
 
-# --- REVIEWS ---
+@app.post("/trips/{trip_id}/panic")
+async def send_panic_alert(
+    trip_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Пассажир нажал тревожную кнопку — отправляем уведомление в Telegram поддержки.
+    TELEGRAM_ADMIN_CHAT_ID должен быть задан в env (chat_id группы или личного чата поддержки).
+    """
+    import os, httpx
+
+    trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
+
+    admin_chat_id = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+    if not bot_token:
+        return {"sent": False, "reason": "bot_token_missing"}
+
+    # Если нет admin chat — fallback: отправляем самому пользователю
+    if not admin_chat_id:
+        admin_chat_id = auth.get_telegram_chat_id(current_user.phone, db)
+
+    if not admin_chat_id:
+        return {"sent": False, "reason": "no_chat_id"}
+
+    msg_parts = [
+        "🚨 *ТРЕВОГА — ПАССАЖИР В ОПАСНОСТИ!*",
+        "",
+        f"👤 *{current_user.name}*",
+        f"📱 `{current_user.phone}`",
+        f"🚗 Поездка #*{trip_id}*",
+    ]
+    if trip:
+        msg_parts.append(f"📍 {trip.origin} → {trip.destination}")
+        msg_parts.append(f"🕐 {trip.time}")
+    msg_parts += ["", "⚠️ Срочно свяжитесь с пассажиром!"]
+    message = "\n".join(msg_parts)
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={
+                    "chat_id": admin_chat_id,
+                    "text": message,
+                    "parse_mode": "Markdown",
+                },
+            )
+        return {"sent": resp.status_code == 200}
+    except Exception as e:
+        return {"sent": False, "reason": str(e)}
+
+
 @app.post("/reviews/", response_model=schemas.Review)
 def create_review(review: schemas.ReviewCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Сохраняет отзыв о пользователе после поездки"""
