@@ -3,16 +3,19 @@ from typing import List, Optional
 
 # --- User Schemas ---
 class ReviewBase(BaseModel):
-    author_name: str
     text: str
     rating: int
 
 class ReviewCreate(ReviewBase):
+    """Клиент передаёт только target user_id, rating и text.
+    author_name всегда берётся из JWT-токена на бэкенде.
+    """
     user_id: int
 
 class Review(ReviewBase):
     id: int
     user_id: int
+    author_name: str
 
     class Config:
         from_attributes = True
@@ -57,7 +60,7 @@ class TripBase(BaseModel):
     price_per_seat: Optional[int] = 0  # стоимость места в сомах (0 = договориться)
 
 class TripCreate(TripBase):
-    user_id: int
+    pass
 
 class Trip(TripBase):
     id: int
@@ -72,7 +75,6 @@ class Trip(TripBase):
 # --- Chat Schemas ---
 class ChatMessageBase(BaseModel):
     trip_id: int
-    sender_id: int
     text: str
     timestamp: str
 
@@ -81,6 +83,7 @@ class ChatMessageCreate(ChatMessageBase):
 
 class ChatMessage(ChatMessageBase):
     id: int
+    sender_id: int
     sender: Optional[User] = None
 
     class Config:

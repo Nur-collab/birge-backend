@@ -125,26 +125,6 @@ def get_current_user(
 
 
 # --- USERS ---
-@app.get("/users/", response_model=List[schemas.User])
-def read_users(db: Session = Depends(get_db)):
-    users = db.query(models.User).all()
-    # Populate mock reviews if they don't have any, just for testing
-    for user in users:
-        pass # In a real app we might load relationships here explicitly if needed
-    return users
-
-@app.post("/users/", response_model=schemas.User)
-def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(models.User).filter(models.User.phone == user.phone).first()
-    if db_user:
-        raise HTTPException(status_code=400, detail="Phone already registered")
-    
-    new_user = models.User(name=user.name, phone=user.phone, photo=user.photo)
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    return new_user
-
 # --- AUTH ---
 @app.post("/auth/send-code")
 async def send_code(payload: dict, db: Session = Depends(get_db)):
@@ -412,8 +392,8 @@ def read_scheduled_trips(
 
 
 @app.post("/trips/", response_model=schemas.Trip)
-def create_trip(trip: schemas.TripCreate, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.id == trip.user_id).first()
+def create_trip(trip: schemas.TripCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    user = current_user
     if not user:
          raise HTTPException(status_code=404, detail="User not found")
 
@@ -436,6 +416,7 @@ def create_trip(trip: schemas.TripCreate, db: Session = Depends(get_db)):
     db.commit()
 
     trip_data = trip.model_dump()
+    trip_data["user_id"] = user.id
 
     # Если дата поездки в будущем — ставим статус 'scheduled', иначе 'active'
     trip_date = trip_data.get("date")
@@ -451,7 +432,7 @@ def create_trip(trip: schemas.TripCreate, db: Session = Depends(get_db)):
     return new_trip
 
 @app.get("/trips/matches", response_model=List[schemas.Trip])
-def find_matches(user_id: int, role: str, origin: str, destination: str, time: str, date: Optional[str] = None, db: Session = Depends(get_db)):
+def find_matches(role: str, origin: str, destination: str, time: str, date: Optional[str] = None, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
     Улучшенный алгоритм поиска попутчиков:
     1. Haversine-расстояние по геокоординатам (радиус 2км)
@@ -551,7 +532,7 @@ def find_matches(user_id: int, role: str, origin: str, destination: str, time: s
     trip_query = db.query(models.Trip).options(joinedload(models.Trip.user)).filter(
         models.Trip.role == target_role,
         _or(models.Trip.status == "active", models.Trip.status == "scheduled"),
-        models.Trip.user_id != user_id
+        models.Trip.user_id != current_user.id
     )
 
     # Фильтр по дате: если дата передана — показываем только её (+ legacy записи без даты)
@@ -782,38 +763,53 @@ async def websocket_endpoint(websocket: WebSocket, trip_id: str, user_id: int, d
         manager.disconnect(websocket, trip_id)
 
 @app.get("/trips/{trip_id}/messages", response_model=List[schemas.ChatMessage])
-def get_trip_messages(trip_id: int, db: Session = Depends(get_db)):
+def get_trip_messages(trip_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Возвращает историю сообщений поездки"""
     messages = db.query(models.ChatMessage).filter(models.ChatMessage.trip_id == trip_id).all()
     return messages
 
 
 @app.patch("/trips/{trip_id}/status")
-def update_trip_status(trip_id: int, payload: dict, db: Session = Depends(get_db)):
-    """Обновляет статус поездки: active | matched | completed"""
+async def update_trip_status(
+    trip_id: int,
+    payload: dict,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Обновляет статус поездки: active | matched | in_progress | completed.
+    При переходе в 'completed' — уведомляет всех принятых пассажиров через SSE.
+    """
     trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
     new_status = payload.get("status", "active")
     trip.status = new_status
     db.commit()
+
+    # Уведомляем всех пассажиров через SSE о завершении поездки
+    if new_status == "completed":
+        accepted = db.query(models.TripRequest).filter(
+            models.TripRequest.trip_id == trip_id,
+            models.TripRequest.status == "accepted",
+        ).all()
+        import json as _json
+        event_data = _json.dumps({"event": "trip_completed", "trip_id": trip_id})
+        for req in accepted:
+            await sse_manager.push(req.requester_id, event_data)
+
     return {"id": trip_id, "status": new_status}
 
 
 @app.delete("/trips/{trip_id}")
-def cancel_trip(trip_id: int, authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+def cancel_trip(
+    trip_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Отмена активной поездки текущим пользователем."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    token = _extract_token(authorization)
-    user_id = auth.verify_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
     trip = db.query(models.Trip).filter(
         models.Trip.id == trip_id,
-        models.Trip.user_id == user_id
+        models.Trip.user_id == current_user.id,
     ).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found or access denied")
@@ -825,7 +821,7 @@ def cancel_trip(trip_id: int, authorization: Optional[str] = Header(None), db: S
 
 # --- REVIEWS ---
 @app.post("/reviews/", response_model=schemas.Review)
-def create_review(review: schemas.ReviewCreate, db: Session = Depends(get_db)):
+def create_review(review: schemas.ReviewCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Сохраняет отзыв о пользователе после поездки"""
     # Проверяем что пользователь существует
     user = db.query(models.User).filter(models.User.id == review.user_id).first()
@@ -835,7 +831,7 @@ def create_review(review: schemas.ReviewCreate, db: Session = Depends(get_db)):
     # Сохраняем отзыв
     new_review = models.Review(
         user_id=review.user_id,
-        author_name=review.author_name,
+        author_name=current_user.name,
         text=review.text,
         rating=review.rating
     )
@@ -856,13 +852,18 @@ def create_review(review: schemas.ReviewCreate, db: Session = Depends(get_db)):
 # --- TRIP REQUESTS (запросы на поездку) ---
 
 @app.post("/trip-requests/")
-async def send_trip_request(payload: dict, db: Session = Depends(get_db)):
+async def send_trip_request(
+    payload: dict,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Пассажир отправляет запрос водителю на поездку.
+    requester_id берётся из JWT (защита от spoofing).
     После сохранения в БД немедленно уведомляет водителя через SSE.
     """
     trip_id = payload.get("trip_id")                     # ID поездки водителя
     requester_trip_id = payload.get("requester_trip_id") # ID поездки пассажира
-    requester_id = payload.get("requester_id")           # ID пассажира
+    requester_id = current_user.id                       # ID пассажира — только из токена!
     driver_id = payload.get("driver_id")                 # ID водителя
 
     # Проверяем, не отправлял ли уже
@@ -887,7 +888,6 @@ async def send_trip_request(payload: dict, db: Session = Depends(get_db)):
     db.refresh(req)
 
     # Собираем данные пассажира для SSE-пуша водителю
-    requester = db.query(models.User).filter(models.User.id == requester_id).first()
     driver_trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
 
     sse_payload = {
@@ -897,9 +897,9 @@ async def send_trip_request(payload: dict, db: Session = Depends(get_db)):
         "requester_id": requester_id,
         "driver_id": driver_id,
         "status": "pending",
-        "requester_name": requester.name if requester else "Пассажир",
-        "requester_photo": requester.photo if requester else "",
-        "requester_rating": requester.trust_rating if requester else 5.0,
+        "requester_name": current_user.name,
+        "requester_photo": current_user.photo,
+        "requester_rating": current_user.trust_rating,
         "origin": driver_trip.origin if driver_trip else "",
         "destination": driver_trip.destination if driver_trip else "",
         "time": driver_trip.time if driver_trip else "",
@@ -914,12 +914,17 @@ async def send_trip_request(payload: dict, db: Session = Depends(get_db)):
     return {"id": req.id, "status": "pending"}
 
 
-@app.get("/trip-requests/incoming/{user_id}")
-def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
-    """Водитель получает входящие запросы (pending)"""
+@app.get("/trip-requests/incoming/")
+def get_incoming_requests(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Водитель получает входящие запросы (pending).
+    Возвращает только запросы адресованные ТЕКУЩЕМУ пользователю.
+    """
     requests = db.query(models.TripRequest).filter(
-        models.TripRequest.driver_id == user_id,
-        models.TripRequest.status == "pending"
+        models.TripRequest.driver_id == current_user.id,
+        models.TripRequest.status == "pending",
     ).all()
 
     result = []
@@ -950,18 +955,26 @@ def get_incoming_requests(user_id: int, db: Session = Depends(get_db)):
 
 
 @app.patch("/trip-requests/{request_id}")
-async def respond_to_request(request_id: int, payload: dict, db: Session = Depends(get_db)):
+async def respond_to_request(
+    request_id: int,
+    payload: dict,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Водитель принимает (accepted) или отклоняет (declined) запрос.
     При accepted — мгновенно уведомляет пассажира через SSE.
+    Только водитель (driver_id == current_user.id) может менять статус своего запроса.
     """
     req = db.query(models.TripRequest).filter(models.TripRequest.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Request not found")
+    if req.driver_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     new_status = payload.get("status")  # 'accepted' or 'declined'
     req.status = new_status
 
-    driver = db.query(models.User).filter(models.User.id == req.driver_id).first()
+    driver = current_user  # уже загружен через Depends
 
     # Если принят — увеличиваем счётчик мест явно
     if new_status == "accepted":
@@ -981,11 +994,11 @@ async def respond_to_request(request_id: int, payload: dict, db: Session = Depen
         "requester_trip_id": req.requester_trip_id,
         "requester_id": req.requester_id,
         "driver_id": req.driver_id,
-        "driver_name": driver.name if driver else None,
-        "driver_photo": driver.photo if driver else None,
-        "driver_car_model": driver.car_model if driver else None,
-        "driver_car_plate": driver.car_plate if driver else None,
-        "driver_car_color": driver.car_color if driver else None,
+        "driver_name": driver.name,
+        "driver_photo": driver.photo,
+        "driver_car_model": driver.car_model,
+        "driver_car_plate": driver.car_plate,
+        "driver_car_color": driver.car_color,
     }
 
     # Мгновенно уведомляем пассажира через SSE (не ждём polling)
@@ -996,12 +1009,18 @@ async def respond_to_request(request_id: int, payload: dict, db: Session = Depen
     return response_payload
 
 
-@app.get("/trip-requests/status/{requester_id}/{trip_id}")
-def check_request_status(requester_id: int, trip_id: int, db: Session = Depends(get_db)):
-    """Пассажир проверяет статус своего запроса (polling)"""
+@app.get("/trip-requests/status/{trip_id}")
+def check_request_status(
+    trip_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Пассажир проверяет статус своего запроса на поездку водителя (polling).
+    requester_id берётся из JWT — пользователь не может запросить чужой статус.
+    """
     req = db.query(models.TripRequest).filter(
         models.TripRequest.trip_id == trip_id,
-        models.TripRequest.requester_id == requester_id,
+        models.TripRequest.requester_id == current_user.id,
     ).order_by(models.TripRequest.id.desc()).first()
 
     if not req:
@@ -1023,7 +1042,7 @@ def check_request_status(requester_id: int, trip_id: int, db: Session = Depends(
 
 
 @app.get("/trips/{trip_id}/passengers")
-def get_trip_passengers(trip_id: int, db: Session = Depends(get_db)):
+def get_trip_passengers(trip_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Список принятых пассажиров для поездки водителя"""
     trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
     if not trip:
@@ -1158,7 +1177,9 @@ async def _reminder_loop():
                         continue  # уже отправляли в этой сессии
 
                     # --- Напоминаем ВОДИТЕЛЯ ---
-                    driver_user = db.query(models.User).filter(models.User.id == trip.user_id).first()
+                    driver_user = db.query(models.User).filter(
+                        models.User.id == trip.user_id
+                    ).first()
                     if driver_user:
                         driver_chat_id = auth.get_telegram_chat_id(driver_user.phone, db)
                         if driver_chat_id:
