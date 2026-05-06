@@ -1,7 +1,7 @@
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Float, DateTime
 from sqlalchemy.orm import relationship
 from database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 
 class User(Base):
     __tablename__ = "users"
@@ -37,6 +37,7 @@ class Trip(Base):
     seats = Column(Integer, default=3)         # макс мест (для водителя)
     seats_taken = Column(Integer, default=0)   # занято мест
     price_per_seat = Column(Integer, default=0) # стоимость одного места в сомах (0 = бесплатно)
+    reminder_sent = Column(Boolean, default=False) # True = напоминание уже отправлено (не повторяем при рестарте)
 
     user = relationship("User", back_populates="trips")
 
@@ -100,4 +101,4 @@ class TelegramBinding(Base):
     phone = Column(String, unique=True, index=True)          # "+996 555 123 456" (читаемый формат)
     phone_normalized = Column(String, index=True)             # "996555123456" (только цифры, для быстрого поиска)
     chat_id = Column(Integer, index=True)                     # Telegram chat_id пользователя
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))

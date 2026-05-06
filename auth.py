@@ -1,7 +1,7 @@
 import os
 import secrets
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
 
@@ -32,7 +32,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -133,7 +133,7 @@ def save_sms_code(phone: str, code: str, db):
     """
     from models import SmsCode
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     existing = db.query(SmsCode).filter(SmsCode.phone == phone).first()
 
     if existing:

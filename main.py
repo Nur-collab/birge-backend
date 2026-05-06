@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -24,6 +25,8 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN price_per_seat INTEGER DEFAULT 0",
                 # phone_normalized: только цифры, индекс для быстрого поиска chat_id
                 "ALTER TABLE telegram_bindings ADD COLUMN phone_normalized TEXT",
+                # reminder_sent: флаг отправки напоминания (не теряется при рестарте)
+                "ALTER TABLE trips ADD COLUMN reminder_sent BOOLEAN DEFAULT 0",
             ]
         else:
             # PostgreSQL поддерживает IF NOT EXISTS
@@ -33,6 +36,7 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS price_per_seat INTEGER DEFAULT 0",
                 "ALTER TABLE telegram_bindings ADD COLUMN IF NOT EXISTS phone_normalized TEXT",
+                "ALTER TABLE trips ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE",
             ]
         for sql in migrations:
             try:
@@ -49,7 +53,14 @@ try:
 except Exception as e:
     print(f"Migration warning: {e}")
 
-app = FastAPI(title="Birge API - MVP Backend")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle: startup → yield → shutdown."""
+    await startup_tasks()
+    yield
+    # shutdown — ничего не делаем
+
+app = FastAPI(title="Birge API - MVP Backend", lifespan=lifespan)
 
 @app.get("/health")
 def health_check():
@@ -196,9 +207,19 @@ def verify_code(payload: dict, db: Session = Depends(get_db)):
 @app.get("/users/me", response_model=schemas.User)
 def read_current_user(
     current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """Возвращает профиль текущего пользователя по JWT токену."""
-    return current_user
+    """Возвращает профиль текущего пользователя по JWT токену.
+    Eager-load отзывов: без этого Profile.jsx покажет 0 отзывов.
+    """
+    from sqlalchemy.orm import selectinload
+    user = (
+        db.query(models.User)
+        .options(selectinload(models.User.reviews))
+        .filter(models.User.id == current_user.id)
+        .first()
+    )
+    return user or current_user
 
 @app.patch("/users/me", response_model=schemas.User)
 def update_current_user(
@@ -832,23 +853,56 @@ async def update_trip_status(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Обновляет статус поездки: active | matched | in_progress | completed.
-    При переходе в 'completed' — уведомляет всех принятых пассажиров через SSE.
+    """Обновляет статус поездки.
+
+    Поддерживаемые переходы:
+      active | matched | in_progress | completed — управляет водитель.
+      passenger_cancelled — пассажир выходит из поездки; водитель получает SSE.
     """
+    import json as _json
+
     trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+
     new_status = payload.get("status", "active")
+
+    # --- Пассажир отменяет участие ---
+    if new_status == "passenger_cancelled":
+        # Ищем принятый запрос текущего пользователя на эту поездку
+        req = db.query(models.TripRequest).filter(
+            models.TripRequest.trip_id == trip_id,
+            models.TripRequest.requester_id == current_user.id,
+            models.TripRequest.status == "accepted",
+        ).first()
+        if req:
+            req.status = "cancelled"
+            # Освобождаем место в поездке
+            if trip.seats_taken and trip.seats_taken > 0:
+                trip.seats_taken -= 1
+            db.commit()
+            # Уведомляем водителя через SSE
+            event_data = _json.dumps({
+                "event": "passenger_cancelled",
+                "trip_id": trip_id,
+                "passenger_name": current_user.name,
+            })
+            await driver_sse_manager.push(trip.user_id, event_data)
+        return {"id": trip_id, "status": "passenger_cancelled"}
+
+    # --- Водитель управляет статусом ---
+    if trip.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the driver can change trip status")
+
     trip.status = new_status
     db.commit()
 
-    # Уведомляем всех пассажиров через SSE о завершении поездки
+    # При завершении — уведомляем всех принятых пассажиров
     if new_status == "completed":
         accepted = db.query(models.TripRequest).filter(
             models.TripRequest.trip_id == trip_id,
             models.TripRequest.status == "accepted",
         ).all()
-        import json as _json
         event_data = _json.dumps({"event": "trip_completed", "trip_id": trip_id})
         for req in accepted:
             await sse_manager.push(req.requester_id, event_data)
@@ -930,27 +984,48 @@ async def send_panic_alert(
 
 
 @app.post("/reviews/", response_model=schemas.Review)
-def create_review(review: schemas.ReviewCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Сохраняет отзыв о пользователе после поездки"""
-    # Проверяем что пользователь существует
+def create_review(
+    review: schemas.ReviewCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет отзыв о пользователе после поездки.
+
+    Правила:
+    - Нельзя оставить отзыв самому себе.
+    - Один пользователь может оставить только один отзыв конкретному человеку.
+      (защита от накрутки рейтинга)
+    """
+    if review.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot review yourself")
+
     user = db.query(models.User).filter(models.User.id == review.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Сохраняем отзыв
+    # Защита от дублирующих отзывов: один автор — один отзыв на пользователя
+    existing = db.query(models.Review).filter(
+        models.Review.user_id == review.user_id,
+        models.Review.author_name == current_user.name,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="You have already reviewed this user",
+        )
+
     new_review = models.Review(
         user_id=review.user_id,
         author_name=current_user.name,
         text=review.text,
-        rating=review.rating
+        rating=review.rating,
     )
     db.add(new_review)
 
-    # Пересчитываем средний рейтинг
+    # Пересчитываем средний рейтинг (включая новый)
     all_reviews = db.query(models.Review).filter(models.Review.user_id == review.user_id).all()
     total_rating = sum(r.rating for r in all_reviews) + review.rating
     count = len(all_reviews) + 1
-    # Округляем до 1 знака без round(float, int) — Pyre2 не резолвит этот overload
     user.trust_rating = int(total_rating * 10 / count) / 10.0
 
     db.commit()
@@ -1275,8 +1350,8 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
-# Множество trip_id для которых уже отправлено напоминание (в текущей сессии сервера)
-_reminded_trips: set[int] = set()
+# Глобальный in-memory set удалён — состояние теперь хранится в БД (Trip.reminder_sent).
+# Это означает что напоминания не дублируются при рестарте сервера.
 
 
 async def _reminder_loop():
@@ -1307,8 +1382,8 @@ async def _reminder_loop():
                 ).all()
 
                 for trip in trips:
-                    if trip.id in _reminded_trips:
-                        continue  # уже отправляли в этой сессии
+                    if trip.reminder_sent:
+                        continue  # уже отправлено (персистентно в БД, не теряется при рестарте)
 
                     # --- Напоминаем ВОДИТЕЛЯ ---
                     driver_user = db.query(models.User).filter(
@@ -1364,15 +1439,15 @@ async def _reminder_loop():
                         await auth.send_telegram_message(passenger_chat_id, msg)
                         print(f"[Reminder] Пассажир uid={passenger.id} trip#{trip.id} → chat {passenger_chat_id}")
 
-                    # Отмечаем как отправленное
-                    _reminded_trips.add(trip.id)
+                    # Отмечаем в БД — персистентно переживёт любой рестарт
+                    trip.reminder_sent = True
+                    db.commit()
 
         except Exception as e:
             # Не даём задаче упасть — продолжаем циклить
             print(f"[Reminder] Ошибка в цикле: {e}")
 
 
-@app.on_event("startup")
 async def startup_tasks():
     """1. Удаляем просроченные active-поездки (дата уже прошла).
     2. Регистрируем Telegram webhook.
