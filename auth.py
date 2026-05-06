@@ -50,18 +50,45 @@ def verify_token(token: str) -> Optional[int]:
 # ---------- Telegram: найти chat_id по номеру телефона ----------
 
 def get_telegram_chat_id(phone: str, db) -> Optional[int]:
-    """Ищет сохранённый Telegram chat_id для данного номера телефона.
-    Нормализует номер (убирает пробелы) перед сравнением.
+    """Ищет Telegram chat_id по нормализованному номеру телефона.
+
+    Использует индексированное поле phone_normalized (только цифры)
+    для O(log N) поиска вместо полного скана таблицы.
+
+    Для старых записей без phone_normalized выполняет self-healing миграцию:
+    находит по старому методу и сразу заполняет поле.
     """
     from models import TelegramBinding
-    # Нормализуем входящий номер — убираем все пробелы
+
     phone_digits = "".join(filter(str.isdigit, phone))
-    # Загружаем все привязки и ищем совпадение по цифрам
-    bindings = db.query(TelegramBinding).all()
-    for binding in bindings:
-        binding_digits = "".join(filter(str.isdigit, binding.phone))
-        if binding_digits == phone_digits:
-            return binding.chat_id
+
+    # Быстрый путь: поиск по индексированному полю (основной сценарий)
+    binding = (
+        db.query(TelegramBinding)
+        .filter(TelegramBinding.phone_normalized == phone_digits)
+        .first()
+    )
+    if binding:
+        return binding.chat_id
+
+    # Fallback: ищем старые записи, у которых phone_normalized ещё не заполнен
+    # (записи созданные до миграции). Исправляем их на лету.
+    old_bindings = (
+        db.query(TelegramBinding)
+        .filter(TelegramBinding.phone_normalized == None)  # noqa: E711
+        .all()
+    )
+    for b in old_bindings:
+        b_digits = "".join(filter(str.isdigit, b.phone))
+        # Всегда заполняем поле для найденной записи (self-healing)
+        b.phone_normalized = b_digits
+        if b_digits == phone_digits:
+            db.commit()
+            return b.chat_id
+
+    if old_bindings:
+        db.commit()  # сохраняем все нормализованные поля разом
+
     return None
 
 

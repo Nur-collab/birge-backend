@@ -22,6 +22,8 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN seats_taken INTEGER DEFAULT 0",
                 "ALTER TABLE trips ADD COLUMN date TEXT",
                 "ALTER TABLE trips ADD COLUMN price_per_seat INTEGER DEFAULT 0",
+                # phone_normalized: только цифры, индекс для быстрого поиска chat_id
+                "ALTER TABLE telegram_bindings ADD COLUMN phone_normalized TEXT",
             ]
         else:
             # PostgreSQL поддерживает IF NOT EXISTS
@@ -30,6 +32,7 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS seats_taken INTEGER DEFAULT 0",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS price_per_seat INTEGER DEFAULT 0",
+                "ALTER TABLE telegram_bindings ADD COLUMN IF NOT EXISTS phone_normalized TEXT",
             ]
         for sql in migrations:
             try:
@@ -354,20 +357,38 @@ def read_scheduled_trips(
         })
 
     # 2. Поездки где пользователь — ПАССАЖИР (принятые TripRequest для будущих поездок)
-    accepted_requests = db.query(models.TripRequest).filter(
-        models.TripRequest.requester_id == user_id,
-        models.TripRequest.status == "accepted"
-    ).all()
+    from sqlalchemy.orm import joinedload as _jl2
+
+    accepted_requests = (
+        db.query(models.TripRequest)
+        .options(_jl2(models.TripRequest.driver))  # eager-load водителя без N+1
+        .filter(
+            models.TripRequest.requester_id == user_id,
+            models.TripRequest.status == "accepted",
+        )
+        .all()
+    )
+
+    # Bulk-загрузка поездок водителей одним IN-запросом
+    passenger_trip_ids = list({r.trip_id for r in accepted_requests if r.trip_id})
+    passenger_trips_map: dict[int, models.Trip] = {}
+    if passenger_trip_ids:
+        passenger_trips_map = {
+            t.id: t
+            for t in db.query(models.Trip)
+            .filter(models.Trip.id.in_(passenger_trip_ids))
+            .all()
+        }
 
     for req in accepted_requests:
-        driver_trip = db.query(models.Trip).filter(models.Trip.id == req.trip_id).first()
+        driver_trip = passenger_trips_map.get(req.trip_id)
         if not driver_trip:
             continue
         # Только будущие поездки
         trip_date = driver_trip.date or ""
         if not trip_date or trip_date <= today_str:
             continue
-        driver_user = db.query(models.User).filter(models.User.id == req.driver_id).first()
+        driver_user = req.driver  # уже загружен через joinedload
         result.append({
             "trip_id": req.trip_id,
             "requester_trip_id": req.requester_trip_id,
@@ -602,24 +623,33 @@ manager = ConnectionManager()
 
 # --- SSE MANAGER (мгновенные уведомления пассажиру) ---
 class SSEManager:
-    """Хранит asyncio.Queue для каждого requester_id.
-    Когда водитель принимает запрос — кладём event в очередь,
-    пассажир получает его мгновенно через открытый EventSource.
+    """Хранит список asyncio.Queue для каждого user_id.
+
+    Поддерживает несколько одновременных подключений одного пользователя
+    (например, две открытые вкладки браузера) — все получают события.
     """
     def __init__(self):
-        self._queues: dict[int, asyncio.Queue] = {}
+        self._queues: dict[int, list[asyncio.Queue]] = {}
 
     def subscribe(self, user_id: int) -> asyncio.Queue:
+        """Создаёт новую очередь и добавляет её в список для user_id."""
         q: asyncio.Queue = asyncio.Queue()
-        self._queues[user_id] = q
+        if user_id not in self._queues:
+            self._queues[user_id] = []
+        self._queues[user_id].append(q)
         return q
 
-    def unsubscribe(self, user_id: int) -> None:
-        self._queues.pop(user_id, None)
+    def unsubscribe(self, user_id: int, q: asyncio.Queue) -> None:
+        """Удаляет конкретную очередь. Если очередей не осталось — чистим словарь."""
+        queues = self._queues.get(user_id)
+        if queues and q in queues:
+            queues.remove(q)
+        if not queues:
+            self._queues.pop(user_id, None)
 
     async def push(self, user_id: int, data: str) -> None:
-        q = self._queues.get(user_id)
-        if q:
+        """Отправляет событие во все активные очереди пользователя."""
+        for q in list(self._queues.get(user_id, [])):
             await q.put(data)
 
 
@@ -668,7 +698,7 @@ async def driver_trip_request_events(
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
         finally:
-            driver_sse_manager.unsubscribe(driver_id)
+            driver_sse_manager.unsubscribe(driver_id, q)
 
     return StreamingResponse(
         event_generator(),
@@ -719,7 +749,7 @@ async def trip_request_events(
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
         finally:
-            sse_manager.unsubscribe(requester_id)
+            sse_manager.unsubscribe(requester_id, q)
 
     return StreamingResponse(
         event_generator(),
@@ -728,13 +758,34 @@ async def trip_request_events(
     )
 
 @app.websocket("/ws/chat/{trip_id}/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, trip_id: str, user_id: int, db: Session = Depends(get_db)):
+async def websocket_endpoint(
+    websocket: WebSocket,
+    trip_id: str,
+    user_id: int,
+    token: Optional[str] = None,   # ?token= из query-строки (Chat.jsx передаёт при connect)
+    db: Session = Depends(get_db),
+):
+    """WebSocket чат поездки с JWT-авторизацией.
+
+    Клиент подключается как:
+        wss://host/ws/chat/{trip_id}/{user_id}?token=<jwt>
+    Токен проверяется до подключения; несовпадение user_id → закрытие 1008.
+    """
+    # --- Авторизация ---
+    if not token:
+        await websocket.close(code=1008, reason="Token required")
+        return
+    verified_user_id = auth.verify_token(token)
+    if not verified_user_id or verified_user_id != user_id:
+        await websocket.close(code=1008, reason="Invalid or forbidden token")
+        return
+
     await manager.connect(websocket, trip_id)
     try:
         while True:
             data = await websocket.receive_text()
-            
-            # Парсим JSON чтобы получить текст сообщения (ожидаем {"text": "привет"})
+
+            # Парсим JSON: ожидаем {"text": "привет"}
             try:
                 msg_data = json.loads(data)
                 text = msg_data.get("text", "")
@@ -742,25 +793,25 @@ async def websocket_endpoint(websocket: WebSocket, trip_id: str, user_id: int, d
                 text = data
 
             timestamp = datetime.now().strftime("%I:%M %p")
-            
+
             # Сохраняем в БД
             new_msg = models.ChatMessage(
                 trip_id=int(trip_id),
                 sender_id=user_id,
                 text=text,
-                timestamp=timestamp
+                timestamp=timestamp,
             )
             db.add(new_msg)
             db.commit()
             db.refresh(new_msg)
 
-            # Рассылаем всем участникам в формате JSON (вместе с ID отправителя и временем)
+            # Рассылаем всем участникам комнаты
             response_data = {
                 "id": new_msg.id,
                 "text": text,
                 "sender_id": user_id,
                 "timestamp": timestamp,
-                "trip_id": int(trip_id)
+                "trip_id": int(trip_id),
             }
             await manager.broadcast(json.dumps(response_data), trip_id)
 
@@ -980,16 +1031,36 @@ def get_incoming_requests(
     """Водитель получает входящие запросы (pending).
     Возвращает только запросы адресованные ТЕКУЩЕМУ пользователю.
     """
-    requests = db.query(models.TripRequest).filter(
-        models.TripRequest.driver_id == current_user.id,
-        models.TripRequest.status == "pending",
-    ).all()
+    from sqlalchemy.orm import joinedload as _jl
+
+    # Один запрос с eager-load пользователей (без N+1)
+    requests = (
+        db.query(models.TripRequest)
+        .options(
+            _jl(models.TripRequest.requester),
+            _jl(models.TripRequest.driver),
+        )
+        .filter(
+            models.TripRequest.driver_id == current_user.id,
+            models.TripRequest.status == "pending",
+        )
+        .all()
+    )
+
+    # Bulk-загрузка поездок водителя одним IN-запросом (вместо N запросов в цикле)
+    trip_ids = list({r.trip_id for r in requests if r.trip_id})
+    trips_map: dict[int, models.Trip] = {}
+    if trip_ids:
+        trips_map = {
+            t.id: t
+            for t in db.query(models.Trip).filter(models.Trip.id.in_(trip_ids)).all()
+        }
 
     result = []
     for r in requests:
-        requester = db.query(models.User).filter(models.User.id == r.requester_id).first()
-        driver = db.query(models.User).filter(models.User.id == r.driver_id).first()
-        driver_trip = db.query(models.Trip).filter(models.Trip.id == r.trip_id).first()
+        requester = r.requester
+        driver = r.driver
+        driver_trip = trips_map.get(r.trip_id)
         result.append({
             "id": r.id,
             "trip_id": r.trip_id,
@@ -1004,7 +1075,6 @@ def get_incoming_requests(
             "date": driver_trip.date if driver_trip else "",
             "status": r.status,
             "created_at": r.created_at,
-            # Данные машины водителя
             "driver_car_model": driver.car_model if driver else None,
             "driver_car_plate": driver.car_plate if driver else None,
             "driver_car_color": driver.car_color if driver else None,
@@ -1176,13 +1246,19 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
         else:
             phone = f"+996 {digits[-9:-6]} {digits[-6:-3]} {digits[-3:]}"
 
-        # Сохраняем или обновляем привязку
+        # Сохраняем или обновляем привязку (включая phone_normalized для быстрого поиска)
         from models import TelegramBinding
+        phone_normalized_val = "".join(filter(str.isdigit, phone))
         binding = db.query(TelegramBinding).filter(TelegramBinding.phone == phone).first()
         if binding:
             binding.chat_id = chat_id
+            binding.phone_normalized = phone_normalized_val  # обновляем при каждом входе
         else:
-            db.add(TelegramBinding(phone=phone, chat_id=chat_id))
+            db.add(TelegramBinding(
+                phone=phone,
+                phone_normalized=phone_normalized_val,
+                chat_id=chat_id,
+            ))
         db.commit()
 
         await auth.send_telegram_message(

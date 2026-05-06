@@ -97,6 +97,7 @@ class TelegramBinding(Base):
     __tablename__ = "telegram_bindings"
 
     id = Column(Integer, primary_key=True, index=True)
-    phone = Column(String, unique=True, index=True)   # "+996 555 123 456"
-    chat_id = Column(Integer, index=True)              # Telegram chat_id пользователя
+    phone = Column(String, unique=True, index=True)          # "+996 555 123 456" (читаемый формат)
+    phone_normalized = Column(String, index=True)             # "996555123456" (только цифры, для быстрого поиска)
+    chat_id = Column(Integer, index=True)                     # Telegram chat_id пользователя
     created_at = Column(DateTime, default=datetime.utcnow)
