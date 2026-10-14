@@ -13,7 +13,7 @@ if not _env_secret:
     # Это нормально для разработки, но недопустимо в продакшене.
     _env_secret = secrets.token_hex(32)
     print(
-        "[Auth] ⚠️  Переменная окружения SECRET_KEY не задана. "
+        "[Auth] [!] Переменная окружения SECRET_KEY не задана. "
         "JWT-токены будут сбрасываться при каждом рестарте сервера. "
         "Задайте SECRET_KEY в настройках Render."
     )
@@ -26,8 +26,49 @@ SMS_CODE_TTL_MINUTES = 5        # Код действителен 5 минут
 SMS_RATE_LIMIT_SECONDS = 60     # Повторная отправка — не чаще 1 раза в 60 сек
 
 # Telegram Bot
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN",
+    "8730455344:AAHQ3rj5r9kaGVTdDZH0T0CtMpwHyegNqMo"
+)
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+
+KG_OPERATOR_PREFIXES = {
+    "55": "Mega", "99": "Mega",
+    "77": "Beeline", "22": "Beeline",
+    "70": "О!", "50": "О!",
+    "88": "Salam",
+}
+
+
+def normalize_kg_phone(raw_phone: str) -> tuple[bool, str, str, str, str]:
+    """
+    Нормализует и валидирует кыргызский мобильный номер.
+    Возвращает: (is_valid, phone_e164, phone_digits, phone_formatted, operator_name_or_error)
+    """
+    digits = "".join(filter(str.isdigit, raw_phone or ""))
+    if not digits:
+        return False, "", "", "", "Номер не указан."
+
+    if len(digits) == 10 and digits.startswith("0"):
+        digits = "996" + digits[1:]
+    elif len(digits) == 9:
+        digits = "996" + digits
+
+    if len(digits) != 12 or not digits.startswith("996"):
+        return False, "", "", "", "Номер должен содержать 9 цифр после кода страны (+996)."
+
+    operator_code = digits[3:5]
+    operator_name = KG_OPERATOR_PREFIXES.get(operator_code)
+    if not operator_name:
+        return (
+            False, "", "", "",
+            f"Неизвестный код оператора '{operator_code}'. Поддерживаются: Mega (55x, 99x), Beeline (77x, 22x), О! (70x, 50x), Salam (88x)."
+        )
+
+    phone_e164 = f"+{digits}"
+    phone_formatted = f"+996 {digits[3:6]} {digits[6:9]} {digits[9:12]}"
+    return True, phone_e164, digits, phone_formatted, operator_name
 
 
 def create_access_token(data: dict):
@@ -51,28 +92,28 @@ def verify_token(token: str) -> Optional[int]:
 
 def get_telegram_chat_id(phone: str, db) -> Optional[int]:
     """Ищет Telegram chat_id по нормализованному номеру телефона.
-
-    Использует индексированное поле phone_normalized (только цифры)
-    для O(log N) поиска вместо полного скана таблицы.
-
-    Для старых записей без phone_normalized выполняет self-healing миграцию:
-    находит по старому методу и сразу заполняет поле.
+    Проверяет точное совпадение по phone_normalized или phone.
     """
     from models import TelegramBinding
 
-    phone_digits = "".join(filter(str.isdigit, phone))
+    phone_digits = "".join(filter(str.isdigit, phone or ""))
+    if not phone_digits:
+        return None
 
-    # Быстрый путь: поиск по индексированному полю (основной сценарий)
+    # Поиск по индексированному полю phone_normalized
     binding = (
         db.query(TelegramBinding)
-        .filter(TelegramBinding.phone_normalized == phone_digits)
+        .filter(
+            (TelegramBinding.phone_normalized == phone_digits)
+            | (TelegramBinding.phone == phone)
+            | (TelegramBinding.phone_normalized.endswith(phone_digits[-9:]))
+        )
         .first()
     )
     if binding:
         return binding.chat_id
 
-    # Fallback: ищем старые записи, у которых phone_normalized ещё не заполнен
-    # (записи созданные до миграции). Исправляем их на лету.
+    # Fallback для старых записей
     old_bindings = (
         db.query(TelegramBinding)
         .filter(TelegramBinding.phone_normalized == None)  # noqa: E711
@@ -80,14 +121,13 @@ def get_telegram_chat_id(phone: str, db) -> Optional[int]:
     )
     for b in old_bindings:
         b_digits = "".join(filter(str.isdigit, b.phone))
-        # Всегда заполняем поле для найденной записи (self-healing)
         b.phone_normalized = b_digits
-        if b_digits == phone_digits:
+        if b_digits == phone_digits or b_digits.endswith(phone_digits[-9:]):
             db.commit()
             return b.chat_id
 
     if old_bindings:
-        db.commit()  # сохраняем все нормализованные поля разом
+        db.commit()
 
     return None
 
@@ -104,20 +144,25 @@ async def send_telegram_code(chat_id: int, code: str) -> bool:
     return await send_telegram_message(chat_id, message)
 
 
-async def send_telegram_message(chat_id: int, text: str) -> bool:
-    """Отправляет любое сообщение через Telegram Bot."""
-    if not TELEGRAM_BOT_TOKEN:
-        return False
+async def send_telegram_message(
+    chat_id: int | str,
+    text: str,
+    reply_markup: Optional[dict] = None
+) -> bool:
+    """Отправляет сообщение через Telegram Bot с поддержкой Markdown и клавиатуры."""
+    token = TELEGRAM_BOT_TOKEN or "8730455344:AAHQ3rj5r9kaGVTdDZH0T0CtMpwHyegNqMo"
+    api_url = f"https://api.telegram.org/bot{token}"
     try:
+        payload: dict = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{TELEGRAM_API_URL}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                },
-            )
+            resp = await client.post(f"{api_url}/sendMessage", json=payload)
             return resp.status_code == 200 and resp.json().get("ok", False)
     except Exception as e:
         print(f"[Telegram] Ошибка отправки: {e}")
@@ -171,14 +216,19 @@ def verify_sms_code(phone: str, code: str, db) -> bool:
     """
     from models import SmsCode
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     entry = db.query(SmsCode).filter(SmsCode.phone == phone).first()
 
     if not entry:
         return False
     if entry.is_used:
         return False
-    if entry.expires_at < now:
+    # Нормализуем expires_at: если naive — считаем UTC
+    exp = entry.expires_at
+    if exp is not None and exp.tzinfo is None:
+        from datetime import timezone as _tz
+        exp = exp.replace(tzinfo=_tz.utc)
+    if exp is None or exp < now:
         return False  # Код устарел
     if entry.code != code:
         return False
