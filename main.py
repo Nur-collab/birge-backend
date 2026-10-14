@@ -1646,8 +1646,8 @@ async def startup_tasks():
 
     # --- Telegram webhook ---
     import os
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "8730455344:AAHQ3rj5r9kaGVTdDZH0T0CtMpwHyegNqMo")
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://birge-backend.onrender.com")
     if not token or not render_url:
         print("[Telegram] BOT_TOKEN или RENDER_EXTERNAL_URL не заданы — webhook не зарегистрирован")
         return
