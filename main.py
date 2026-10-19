@@ -88,8 +88,13 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:4173",
         "https://birge-nine.vercel.app",
         "https://birge.vercel.app",
+        "https://birge-5c900.web.app",
+        "https://birge-5c900.firebaseapp.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -288,30 +293,68 @@ def get_my_active_trip(
 ):
     today = get_bishkek_today_str()
 
+    # 1. Поездка, созданная самим пользователем (как водитель или пассажир)
     trip = (
         db.query(models.Trip)
         .filter(
             models.Trip.user_id == current_user.id,
-            models.Trip.status == "active",
+            models.Trip.status.in_(["active", "matched", "in_progress"]),
             models.Trip.date == today,
         )
         .order_by(models.Trip.id.desc())
         .first()
     )
 
-    if not trip:
-        return {"found": False}
+    if trip:
+        return {
+            "found": True,
+            "trip_id": trip.id,
+            "role": trip.role,
+            "my_role": trip.role,
+            "is_driver": trip.role == "driver",
+            "origin": trip.origin,
+            "destination": trip.destination,
+            "time": trip.time,
+            "date": trip.date,
+            "seats": trip.seats or 3,
+        }
 
-    return {
-        "found": True,
-        "trip_id": trip.id,
-        "role": trip.role,
-        "origin": trip.origin,
-        "destination": trip.destination,
-        "time": trip.time,
-        "date": trip.date,
-        "seats": trip.seats or 3,
-    }
+    # 2. Если пользователь — пассажир с принятым запросом в поездке водителя
+    accepted_request = (
+        db.query(models.TripRequest)
+        .filter(
+            models.TripRequest.requester_id == current_user.id,
+            models.TripRequest.status == "accepted",
+        )
+        .order_by(models.TripRequest.id.desc())
+        .first()
+    )
+
+    if accepted_request:
+        driver_trip = (
+            db.query(models.Trip)
+            .filter(
+                models.Trip.id == accepted_request.trip_id,
+                models.Trip.status.in_(["active", "matched", "in_progress"]),
+            )
+            .first()
+        )
+        if driver_trip:
+            return {
+                "found": True,
+                "trip_id": driver_trip.id,
+                "role": "passenger",
+                "my_role": "passenger",
+                "is_driver": False,
+                "origin": driver_trip.origin,
+                "destination": driver_trip.destination,
+                "time": driver_trip.time,
+                "date": driver_trip.date,
+                "seats": driver_trip.seats or 3,
+                "driver_id": driver_trip.user_id,
+            }
+
+    return {"found": False}
 
 @app.post("/users/me/verify")
 async def verify_user(
@@ -939,7 +982,7 @@ async def update_trip_status(
     new_status = status_update.status
 
     # --- Пассажир отменяет участие ---
-    if new_status == "passenger_cancelled":
+    if (new_status in ("passenger_cancelled", "cancelled")) and trip.user_id != current_user.id:
         # Ищем принятый запрос текущего пользователя на эту поездку
         req = db.query(models.TripRequest).filter(
             models.TripRequest.trip_id == trip_id,
@@ -960,6 +1003,17 @@ async def update_trip_status(
             })
             await driver_sse_manager.push(trip.user_id, event_data)
         return {"id": trip_id, "status": "passenger_cancelled"}
+
+    # Пассажир завершает поездку со своей стороны (после отправки отзыва)
+    if new_status == "completed" and trip.user_id != current_user.id:
+        req = db.query(models.TripRequest).filter(
+            models.TripRequest.trip_id == trip_id,
+            models.TripRequest.requester_id == current_user.id,
+            models.TripRequest.status == "accepted",
+        ).first()
+        if req:
+            # Для пассажира поездка считается завершённой локально, не ломая статус всей поездки водителя
+            return {"id": trip_id, "status": "passenger_completed"}
 
     # --- Водитель управляет статусом ---
     if trip.user_id != current_user.id:
