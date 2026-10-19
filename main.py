@@ -1180,14 +1180,14 @@ async def send_trip_request(
     requester_id = current_user.id               # ID пассажира — только из токена!
     driver_id = req_in.driver_id                 # ID водителя
 
-    # Проверяем, не отправлял ли уже
+    # Проверяем, не отправлял ли уже активную заявку
     existing = db.query(models.TripRequest).filter(
         models.TripRequest.trip_id == trip_id,
         models.TripRequest.requester_id == requester_id,
-        models.TripRequest.status == "pending",
+        models.TripRequest.status.in_(["pending", "accepted"]),
     ).first()
     if existing:
-        return {"id": existing.id, "status": "pending", "message": "Already sent"}
+        return {"id": existing.id, "status": existing.status, "message": "Already sent"}
 
     req = models.TripRequest(
         trip_id=trip_id,
@@ -1382,6 +1382,9 @@ def get_trip_passengers(trip_id: int, current_user: models.User = Depends(get_cu
     trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+
+    if not is_trip_participant(db, trip_id, current_user.id):
+        raise HTTPException(status_code=403, detail="Access denied to passenger list")
 
     accepted = db.query(models.TripRequest).filter(
         models.TripRequest.trip_id == trip_id,
