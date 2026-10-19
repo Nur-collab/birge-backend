@@ -5,6 +5,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Берём секрет из переменной окружения.
 # На Render: Settings → Environment → Add SECRET_KEY
 _env_secret = os.environ.get("SECRET_KEY", "")
@@ -25,12 +31,10 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 дней
 SMS_CODE_TTL_MINUTES = 5        # Код действителен 5 минут
 SMS_RATE_LIMIT_SECONDS = 60     # Повторная отправка — не чаще 1 раза в 60 сек
 
-# Telegram Bot
-TELEGRAM_BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN",
-    "8730455344:AAHQ3rj5r9kaGVTdDZH0T0CtMpwHyegNqMo"
-)
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+# Telegram Bot (токен должен задаваться в переменных окружения Render / .env)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
+
 
 
 KG_OPERATOR_PREFIXES = {
@@ -73,6 +77,8 @@ def normalize_kg_phone(raw_phone: str) -> tuple[bool, str, str, str, str]:
 
 def create_access_token(data: dict):
     to_encode = data.copy()
+    if "sub" in to_encode:
+        to_encode["sub"] = str(to_encode["sub"])  # RFC 7519: sub claim MUST be a string
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
@@ -83,7 +89,7 @@ def verify_token(token: str) -> Optional[int]:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id_str = payload.get("sub")
-        return int(user_id_str) if user_id_str else None
+        return int(user_id_str) if user_id_str is not None else None
     except (JWTError, ValueError):
         return None
 
@@ -150,7 +156,10 @@ async def send_telegram_message(
     reply_markup: Optional[dict] = None
 ) -> bool:
     """Отправляет сообщение через Telegram Bot с поддержкой Markdown и клавиатуры."""
-    token = TELEGRAM_BOT_TOKEN or "8730455344:AAHQ3rj5r9kaGVTdDZH0T0CtMpwHyegNqMo"
+    token = TELEGRAM_BOT_TOKEN
+    if not token:
+        print("[Telegram] [!] TELEGRAM_BOT_TOKEN не задан в переменных окружения.")
+        return False
     api_url = f"https://api.telegram.org/bot{token}"
     try:
         payload: dict = {
@@ -184,7 +193,10 @@ def save_sms_code(phone: str, code: str, db):
     if existing:
         # Rate limiting: не чаще одного раза в SMS_RATE_LIMIT_SECONDS
         if existing.last_sent_at:
-            seconds_since = (now - existing.last_sent_at).total_seconds()
+            last_sent = existing.last_sent_at
+            if last_sent.tzinfo is None:
+                last_sent = last_sent.replace(tzinfo=timezone.utc)
+            seconds_since = (now - last_sent).total_seconds()
             if seconds_since < SMS_RATE_LIMIT_SECONDS:
                 wait = int(SMS_RATE_LIMIT_SECONDS - seconds_since)
                 return False, f"Подождите {wait} сек. перед повторной отправкой"
@@ -194,6 +206,7 @@ def save_sms_code(phone: str, code: str, db):
         existing.expires_at = now + timedelta(minutes=SMS_CODE_TTL_MINUTES)
         existing.last_sent_at = now
         existing.is_used = False
+        existing.attempts = 0  # Сбрасываем счётчик неверных попыток при новом коде
     else:
         # Первый раз — создаём новую запись
         new_entry = SmsCode(
@@ -202,6 +215,7 @@ def save_sms_code(phone: str, code: str, db):
             expires_at=now + timedelta(minutes=SMS_CODE_TTL_MINUTES),
             last_sent_at=now,
             is_used=False,
+            attempts=0,
         )
         db.add(new_entry)
 
@@ -211,7 +225,8 @@ def save_sms_code(phone: str, code: str, db):
 
 def verify_sms_code(phone: str, code: str, db) -> bool:
     """
-    Проверяет SMS-код из БД.
+    Проверяет SMS-код из БД с защитой от перебора (Brute-force).
+    Лимит: максимум 5 неверных попыток ввода.
     После успешной проверки помечает код как использованный.
     """
     from models import SmsCode
@@ -223,14 +238,27 @@ def verify_sms_code(phone: str, code: str, db) -> bool:
         return False
     if entry.is_used:
         return False
+
+    # Проверяем лимит попыток
+    current_attempts = getattr(entry, "attempts", 0) or 0
+    if current_attempts >= 5:
+        entry.is_used = True
+        db.commit()
+        return False
+
     # Нормализуем expires_at: если naive — считаем UTC
     exp = entry.expires_at
     if exp is not None and exp.tzinfo is None:
-        from datetime import timezone as _tz
-        exp = exp.replace(tzinfo=_tz.utc)
+        exp = exp.replace(tzinfo=timezone.utc)
     if exp is None or exp < now:
         return False  # Код устарел
+
     if entry.code != code:
+        # Неверный код — увеличиваем попытки
+        entry.attempts = current_attempts + 1
+        if entry.attempts >= 5:
+            entry.is_used = True  # Блокируем код после 5 неудачных попыток
+        db.commit()
         return False
 
     # Помечаем как использованный

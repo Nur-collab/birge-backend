@@ -16,12 +16,17 @@ if sys.platform == "win32":
         pass
 
 import httpx
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from database import SessionLocal, engine, Base
 import models
 from main import telegram_webhook
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8730455344:AAHQ3rj5r9kaGVTdDZH0T0CtMpwHyegNqMo")
-API_URL = f"https://api.telegram.org/bot{TOKEN}"
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+API_URL = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 
 # Создаем таблицы если их нет
 Base.metadata.create_all(bind=engine)
@@ -31,6 +36,11 @@ async def main():
     print("=" * 60)
     print("Запуск Telegram-бота Birge (@BirgeAuthBot) в режиме Long Polling...")
     print("=" * 60)
+
+    if not TOKEN:
+        print("[ОШИБКА] Переменная окружения TELEGRAM_BOT_TOKEN не задана.")
+        print("Установите токен: $env:TELEGRAM_BOT_TOKEN='ваш_токен'")
+        return
 
     async with httpx.AsyncClient(timeout=40.0) as client:
         # 1. Проверяем токен

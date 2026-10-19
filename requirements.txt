@@ -6,4 +6,6 @@ passlib
 python-multipart
 aiofiles
 psycopg2-binary
+psycopg[binary]
 httpx
+python-dotenv

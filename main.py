@@ -8,9 +8,19 @@ from typing import List, Optional
 import database, models, schemas, auth
 import random
 import asyncio
+import os
 
 # Initialize DB tables
 models.Base.metadata.create_all(bind=database.engine)
+
+# Часовой пояс Бишкека (UTC+6, круглый год без перехода на летнее время)
+BISHKEK_TZ = timezone(timedelta(hours=6))
+
+def get_bishkek_now() -> datetime:
+    return datetime.now(BISHKEK_TZ)
+
+def get_bishkek_today_str() -> str:
+    return datetime.now(BISHKEK_TZ).date().isoformat()
 
 # Миграция: добавляем новые колонки если их нет (для существующих баз)
 def run_migrations():
@@ -24,10 +34,11 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN seats_taken INTEGER DEFAULT 0",
                 "ALTER TABLE trips ADD COLUMN date TEXT",
                 "ALTER TABLE trips ADD COLUMN price_per_seat INTEGER DEFAULT 0",
-                # phone_normalized: только цифры, индекс для быстрого поиска chat_id
                 "ALTER TABLE telegram_bindings ADD COLUMN phone_normalized TEXT",
-                # reminder_sent: флаг отправки напоминания (не теряется при рестарте)
                 "ALTER TABLE trips ADD COLUMN reminder_sent BOOLEAN DEFAULT 0",
+                "ALTER TABLE sms_codes ADD COLUMN attempts INTEGER DEFAULT 0",
+                "ALTER TABLE reviews ADD COLUMN author_id INTEGER",
+                "ALTER TABLE reviews ADD COLUMN trip_id INTEGER",
             ]
         else:
             # PostgreSQL поддерживает IF NOT EXISTS
@@ -38,6 +49,9 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS price_per_seat INTEGER DEFAULT 0",
                 "ALTER TABLE telegram_bindings ADD COLUMN IF NOT EXISTS phone_normalized TEXT",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE sms_codes ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
+                "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS author_id INTEGER",
+                "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS trip_id INTEGER",
             ]
         for sql in migrations:
             try:
@@ -82,13 +96,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Dependency
-def get_db():
-    db = database.SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Dependency импортируется напрямую из database.py
+from database import get_db, SessionLocal
 
 
 def _extract_token(authorization: Optional[str]) -> str:
@@ -146,23 +155,31 @@ def get_current_user(
 
 # --- USERS ---
 # --- AUTH ---
+class VerifyCodePayload(schemas.VerifyCodeRequest):
+    name: Optional[str] = None
+
 @app.post("/auth/send-code")
-async def send_code(payload: dict, db: Session = Depends(get_db)):
+async def send_code(req: schemas.SendCodeRequest, db: Session = Depends(get_db)):
     """Отправка кода через Telegram Bot (или консоль как fallback). Rate limit: 60 сек."""
-    phone = payload.get("phone", "").strip()
-    if not phone:
+    raw_phone = req.phone.strip()
+    if not raw_phone:
         raise HTTPException(status_code=400, detail="Phone number required")
+
+    # Нормализуем кыргызский номер
+    is_valid, p_e164, p_digits, p_formatted, op_or_err = auth.normalize_kg_phone(raw_phone)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=op_or_err)
 
     # Генерируем 6-значный код
     code = str(random.randint(100000, 999999))
 
-    # Сохраняем в БД (с проверкой rate limit)
-    ok, error_msg = auth.save_sms_code(phone, code, db)
+    # Сохраняем в БД по нормализованному формату (с проверкой rate limit)
+    ok, error_msg = auth.save_sms_code(p_e164, code, db)
     if not ok:
         raise HTTPException(status_code=429, detail=error_msg)
 
-    # Пробуем отправить через Telegram Bot
-    chat_id = auth.get_telegram_chat_id(phone, db)
+    # Пробуем отправить через Telegram Bot (ищем по normalized digits)
+    chat_id = auth.get_telegram_chat_id(p_digits, db)
     tg_sent = False
     if chat_id:
         tg_sent = await auth.send_telegram_code(chat_id, code)
@@ -170,7 +187,7 @@ async def send_code(payload: dict, db: Session = Depends(get_db)):
     # Fallback: выводим в консоль (для разработки)
     if not tg_sent:
         print(f"\n{'='*40}")
-        print(f"📱 КОД ДЛЯ {phone}")
+        print(f"📱 КОД ДЛЯ {p_formatted} ({p_e164})")
         print(f"👉 ВАШ КОД БИРГЕ: {code} 👈")
         if not chat_id:
             print(f"⚠️  Telegram не привязан — код только в консоли")
@@ -180,28 +197,41 @@ async def send_code(payload: dict, db: Session = Depends(get_db)):
     return {"message": f"Code sent via {channel}", "tg_linked": bool(chat_id)}
 
 @app.post("/auth/verify-code")
-def verify_code(payload: dict, db: Session = Depends(get_db)):
+def verify_code(req: VerifyCodePayload, db: Session = Depends(get_db)):
     """Проверяет SMS-код и выдает JWT токен."""
-    phone = payload.get("phone", "").strip()
-    code = payload.get("code", "").strip()
-    name = payload.get("name", "").strip()
+    raw_phone = req.phone.strip()
+    code = req.code.strip()
+    name = (req.name or "").strip()
 
-    if not auth.verify_sms_code(phone, code, db):
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
+    is_valid, p_e164, p_digits, p_formatted, op_or_err = auth.normalize_kg_phone(raw_phone)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=op_or_err)
+
+    if not auth.verify_sms_code(p_e164, code, db):
+        raise HTTPException(status_code=400, detail="Invalid, expired, or locked code")
     
-    # Ищем существующего пользователя или создаём нового
-    user = db.query(models.User).filter(models.User.phone == phone).first()
+    # Ищем существующего пользователя по любому представлению номера
+    user = (
+        db.query(models.User)
+        .filter(
+            (models.User.phone == p_e164)
+            | (models.User.phone == p_formatted)
+            | (models.User.phone == p_digits)
+            | (models.User.phone.like(f"%{p_digits[-9:]}%"))
+        )
+        .first()
+    )
     if not user:
         user = models.User(
             name=name or "Новый пользователь",
-            phone=phone,
-            photo=f"https://i.pravatar.cc/150?u={phone}"
+            phone=p_e164,
+            photo=f"https://i.pravatar.cc/150?u={p_digits}"
         )
         db.add(user)
         db.commit()
         db.refresh(user)
     
-    # Создаём JWT токен
+    # Создаём JWT токен (sub строго строковый)
     token = auth.create_access_token({"sub": str(user.id)})
     return {"access_token": token, "token_type": "bearer", "user_id": user.id}
 
@@ -256,10 +286,7 @@ def get_my_active_trip(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Возвращает active-поездку с датой сегодня, если такая есть.
-    Фронтенд вызывает при входе чтобы предложить возобновить поиск."""
-    import datetime as _dt
-    today = _dt.date.today().isoformat()
+    today = get_bishkek_today_str()
 
     trip = (
         db.query(models.Trip)
@@ -333,8 +360,7 @@ def read_scheduled_trips(
     db: Session = Depends(get_db),
 ):
     """Возвращает запланированные поездки пользователя (и как водителя, и как пассажира)."""
-    import datetime
-    today_str = datetime.date.today().isoformat()
+    today_str = get_bishkek_today_str()
     user_id = current_user.id
 
     result = []
@@ -445,8 +471,7 @@ def create_trip(trip: schemas.TripCreate, current_user: models.User = Depends(ge
     if not user:
          raise HTTPException(status_code=404, detail="User not found")
 
-    import datetime
-    today_str = datetime.date.today().isoformat()
+    today_str = get_bishkek_today_str()
 
     # Сбрасываем лимит, если начался новый день
     if user.last_trip_date != today_str:
@@ -473,7 +498,10 @@ def create_trip(trip: schemas.TripCreate, current_user: models.User = Depends(ge
     else:
         trip_data["status"] = "active"
 
-    new_trip = models.Trip(**trip_data)
+    valid_trip_fields = {c.name for c in models.Trip.__table__.columns}
+    filtered_data = {k: v for k, v in trip_data.items() if k in valid_trip_fields}
+
+    new_trip = models.Trip(**filtered_data)
     db.add(new_trip)
     db.commit()
     db.refresh(new_trip)
@@ -604,8 +632,9 @@ def find_matches(role: str, origin: str, destination: str, time: str, date: Opti
             my_hour, my_min = map(int, time.split(":"))
             t_hour, t_min = map(int, trip.time.split(":"))
             my_total = my_hour * 60 + my_min
-            t_total = t_hour * 60 + t_min
-            if abs(my_total - t_total) <= 30:
+            diff = abs(my_total - t_total)
+            circular_diff = min(diff, 1440 - diff)
+            if circular_diff <= 30:
                 matches.append(trip)
         except ValueError:
             pass
@@ -779,21 +808,45 @@ async def trip_request_events(
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+def is_trip_participant(db: Session, trip_id: int, user_id: int) -> bool:
+    """Проверяет, имеет ли пользователь право доступа к чату поездки (водитель или принятый пассажир)."""
+    trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
+    if not trip:
+        return False
+    # 1. Создатель поездки (водитель или пассажир)
+    if trip.user_id == user_id:
+        return True
+    # 2. Принятый пассажир в поездке водителя
+    accepted_as_passenger = db.query(models.TripRequest).filter(
+        models.TripRequest.trip_id == trip_id,
+        models.TripRequest.requester_id == user_id,
+        models.TripRequest.status == "accepted",
+    ).first()
+    if accepted_as_passenger:
+        return True
+    # 3. Водитель, принявший поездку пассажира
+    accepted_as_driver = db.query(models.TripRequest).filter(
+        models.TripRequest.requester_trip_id == trip_id,
+        models.TripRequest.driver_id == user_id,
+        models.TripRequest.status == "accepted",
+    ).first()
+    return bool(accepted_as_driver)
+
+
 @app.websocket("/ws/chat/{trip_id}/{user_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
     trip_id: str,
     user_id: int,
     token: Optional[str] = None,   # ?token= из query-строки (Chat.jsx передаёт при connect)
-    db: Session = Depends(get_db),
 ):
-    """WebSocket чат поездки с JWT-авторизацией.
+    """WebSocket чат поездки с JWT-авторизацией и защитой от исчерпания пула соединений БД.
 
     Клиент подключается как:
         wss://host/ws/chat/{trip_id}/{user_id}?token=<jwt>
     Токен проверяется до подключения; несовпадение user_id → закрытие 1008.
     """
-    # --- Авторизация ---
+    # --- Авторизация токена ---
     if not token:
         await websocket.close(code=1008, reason="Token required")
         return
@@ -801,6 +854,18 @@ async def websocket_endpoint(
     if not verified_user_id or verified_user_id != user_id:
         await websocket.close(code=1008, reason="Invalid or forbidden token")
         return
+
+    try:
+        trip_int_id = int(trip_id)
+    except ValueError:
+        await websocket.close(code=1008, reason="Invalid trip_id")
+        return
+
+    # Проверяем права доступа к чату поездки (точечная сессия, не блокирующая пул)
+    with SessionLocal() as db:
+        if not is_trip_participant(db, trip_int_id, user_id):
+            await websocket.close(code=1008, reason="Access denied to this trip chat")
+            return
 
     await manager.connect(websocket, trip_id)
     try:
@@ -814,35 +879,40 @@ async def websocket_endpoint(
             except json.JSONDecodeError:
                 text = data
 
-            timestamp = datetime.now().strftime("%I:%M %p")
+            timestamp = get_bishkek_now().strftime("%I:%M %p")
 
-            # Сохраняем в БД
-            new_msg = models.ChatMessage(
-                trip_id=int(trip_id),
-                sender_id=user_id,
-                text=text,
-                timestamp=timestamp,
-            )
-            db.add(new_msg)
-            db.commit()
-            db.refresh(new_msg)
+            # Сохраняем в БД точечно через SessionLocal (соединение освобождается сразу)
+            with SessionLocal() as db:
+                new_msg = models.ChatMessage(
+                    trip_id=trip_int_id,
+                    sender_id=user_id,
+                    text=text,
+                    timestamp=timestamp,
+                )
+                db.add(new_msg)
+                db.commit()
+                db.refresh(new_msg)
+                msg_id = new_msg.id
 
             # Рассылаем всем участникам комнаты
             response_data = {
-                "id": new_msg.id,
+                "id": msg_id,
                 "text": text,
                 "sender_id": user_id,
                 "timestamp": timestamp,
-                "trip_id": int(trip_id),
+                "trip_id": trip_int_id,
             }
             await manager.broadcast(json.dumps(response_data), trip_id)
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, trip_id)
 
+
 @app.get("/trips/{trip_id}/messages", response_model=List[schemas.ChatMessage])
 def get_trip_messages(trip_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Возвращает историю сообщений поездки"""
+    """Возвращает историю сообщений поездки с обязательной проверкой прав доступа."""
+    if not is_trip_participant(db, trip_id, current_user.id):
+        raise HTTPException(status_code=403, detail="Access denied to this trip chat")
     messages = db.query(models.ChatMessage).filter(models.ChatMessage.trip_id == trip_id).all()
     return messages
 
@@ -850,7 +920,7 @@ def get_trip_messages(trip_id: int, current_user: models.User = Depends(get_curr
 @app.patch("/trips/{trip_id}/status")
 async def update_trip_status(
     trip_id: int,
-    payload: dict,
+    status_update: schemas.TripStatusUpdate,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -866,7 +936,7 @@ async def update_trip_status(
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    new_status = payload.get("status", "active")
+    new_status = status_update.status
 
     # --- Пассажир отменяет участие ---
     if new_status == "passenger_cancelled":
@@ -1004,11 +1074,14 @@ def create_review(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Защита от дублирующих отзывов: один автор — один отзыв на пользователя
-    existing = db.query(models.Review).filter(
+    # Защита от дублирующих отзывов: проверяем по author_id и author_name
+    query = db.query(models.Review).filter(
         models.Review.user_id == review.user_id,
-        models.Review.author_name == current_user.name,
-    ).first()
+        (models.Review.author_id == current_user.id) | (models.Review.author_name == current_user.name),
+    )
+    if review.trip_id:
+        query = query.filter(models.Review.trip_id == review.trip_id)
+    existing = query.first()
     if existing:
         raise HTTPException(
             status_code=409,
@@ -1017,7 +1090,9 @@ def create_review(
 
     new_review = models.Review(
         user_id=review.user_id,
+        author_id=current_user.id,
         author_name=current_user.name,
+        trip_id=review.trip_id,
         text=review.text,
         rating=review.rating,
     )
@@ -1038,7 +1113,7 @@ def create_review(
 
 @app.post("/trip-requests/")
 async def send_trip_request(
-    payload: dict,
+    req_in: schemas.TripRequestCreate,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1046,10 +1121,10 @@ async def send_trip_request(
     requester_id берётся из JWT (защита от spoofing).
     После сохранения в БД немедленно уведомляет водителя через SSE.
     """
-    trip_id = payload.get("trip_id")                     # ID поездки водителя
-    requester_trip_id = payload.get("requester_trip_id") # ID поездки пассажира
-    requester_id = current_user.id                       # ID пассажира — только из токена!
-    driver_id = payload.get("driver_id")                 # ID водителя
+    trip_id = req_in.trip_id                     # ID поездки водителя
+    requester_trip_id = req_in.requester_trip_id # ID поездки пассажира
+    requester_id = current_user.id               # ID пассажира — только из токена!
+    driver_id = req_in.driver_id                 # ID водителя
 
     # Проверяем, не отправлял ли уже
     existing = db.query(models.TripRequest).filter(
@@ -1066,7 +1141,7 @@ async def send_trip_request(
         requester_id=requester_id,
         driver_id=driver_id,
         status="pending",
-        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        created_at=get_bishkek_now().strftime("%Y-%m-%d %H:%M:%S"),
     )
     db.add(req)
     db.commit()
@@ -1161,7 +1236,7 @@ def get_incoming_requests(
 @app.patch("/trip-requests/{request_id}")
 async def respond_to_request(
     request_id: int,
-    payload: dict,
+    status_update: schemas.TripRequestStatusUpdate,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1174,8 +1249,10 @@ async def respond_to_request(
         raise HTTPException(status_code=404, detail="Request not found")
     if req.driver_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail="Request has already been processed")
 
-    new_status = payload.get("status")  # 'accepted' or 'declined'
+    new_status = status_update.status
     req.status = new_status
 
     driver = current_user  # уже загружен через Depends
@@ -1278,18 +1355,26 @@ def get_trip_passengers(trip_id: int, current_user: models.User = Depends(get_cu
     }
 
 
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+
 # --- TELEGRAM BOT WEBHOOK ---
 @app.post("/bot/webhook")
-async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
+async def telegram_webhook(
+    payload: dict,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(None, alias="X-Telegram-Bot-Api-Secret-Token"),
+    db: Session = Depends(get_db),
+):
     """
     Telegram шлёт сюда все входящие сообщения.
+    Защищён проверкой X-Telegram-Bot-Api-Secret-Token.
     Обрабатывает:
-      - /start и deep-linking /start <phone>
-      - Передачу контакта через кнопку «Поделиться номером»
-      - Ручной ввод номера телефона в любых форматах
-      - Проверку наличия пользователя в базе данных Birge (models.User)
+      - Передачу контакта через кнопку «Поделиться номером» (с проверкой ownership)
       - Команды /status, /check, /test, /help
     """
+    if TELEGRAM_WEBHOOK_SECRET:
+        if x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Forbidden: Invalid webhook secret")
+
     message = payload.get("message", {})
     if not message:
         return {"ok": True}
@@ -1385,20 +1470,21 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
                 f"а все уведомления начнут мгновенно приходить сюда!"
             )
 
-    # 1. Если отправлен контакт через кнопку
+    # 1. Если отправлен контакт через кнопку «Поделиться номером»
     if contact:
+        contact_user_id = contact.get("user_id")
+        sender_id = sender.get("id")
+        if contact_user_id != sender_id:
+            await _reply("❌ Вы можете отправить только свой собственный контакт через кнопку «Поделиться номером».")
+            return {"ok": True}
+
         contact_phone = contact.get("phone_number", "").strip()
         if contact_phone:
             await _process_phone_binding(contact_phone)
             return {"ok": True}
 
-    # 2. Команда /start и deep-link /start <phone>
+    # 2. Команда /start
     if text.startswith("/start"):
-        parts = text.split(maxsplit=1)
-        if len(parts) > 1 and parts[1].strip():
-            await _process_phone_binding(parts[1].strip())
-            return {"ok": True}
-
         await _reply(
             f"👋 Привет, *{first_name}*!\n\n"
             f"Я официальный бот сервиса совместных поездок *Birge* (Бишкек и Кыргызстан) 🚗\n\n"
@@ -1406,8 +1492,8 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
             f"• 🔐 Коды входа в приложение\n"
             f"• 🚗 Мгновенные запросы от попутчиков\n"
             f"• ⏰ Напоминания за час до поездки\n\n"
-            f"Чтобы подключить ваш номер, нажмите кнопку ниже:\n"
-            f"*«📱 Поделиться номером»* или просто напишите ваш номер в ответном сообщении."
+            f"Чтобы безопасно привязать номер, нажмите кнопку ниже:\n"
+            f"*«📱 Поделиться номером»*."
         )
         return {"ok": True}
 
@@ -1486,7 +1572,7 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
     if text in ("/help", "❓ Помощь", "помощь"):
         await _reply(
             "ℹ️ *Справка по боту Birge:*\n\n"
-            "• Нажмите *«📱 Поделиться номером»* или отправьте номер текстом (`0555123456`)\n"
+            "• Нажмите *«📱 Поделиться номером»* для безопасной привязки аккаунта\n"
             "• `/status` — проверить ваш статус привязки и верификации\n"
             "• `/check <номер>` — проверить наличие номера в системе Birge\n"
             "• `/test` — проверить доставку сообщений\n\n"
@@ -1495,17 +1581,10 @@ async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
         )
         return {"ok": True}
 
-    # 7. Ручной ввод номера телефона текстом
-    digits_in_text = "".join(filter(str.isdigit, text))
-    if len(digits_in_text) >= 9:
-        await _process_phone_binding(text)
-        return {"ok": True}
-
-    # 8. Неизвестное сообщение
+    # 7. Любое другое сообщение — для безопасности привязка возможна только через Telegram-контакт
     await _reply(
-        "❓ Не удалось распознать команду или номер телефона.\n\n"
-        "Отправьте номер вашего мобильного телефона (например: `0555123456` или `+996 555 123 456`) "
-        "или нажмите кнопку *«📱 Поделиться номером»* ниже."
+        "🔒 Для защиты вашего аккаунта привязка номера телефона выполняется *только* через подтверждённый Telegram-контакт.\n\n"
+        "👇 Нажмите кнопку *«📱 Поделиться номером»* внизу для безопасной привязки."
     )
     return {"ok": True}
 
@@ -1518,34 +1597,45 @@ async def _reminder_loop():
     """Background loop: каждую минуту проверяет запланированные поездки.
     Если до начала поездки осталось 50-70 минут — отправляем Telegram-напоминание
     водителю И всем принятым пассажирам.
+    Учитывает часовой пояс Бишкека (UTC+6) и корректный переход через полночь.
     """
-    import datetime as _dt
     from models import TelegramBinding
 
     while True:
         await asyncio.sleep(60)  # проверяем раз в минуту
         try:
-            now = _dt.datetime.now()
-            today = now.date().isoformat()
+            now = get_bishkek_now()
 
             # Окно проверки: от 50 до 70 минут до начала поездки
-            window_from = (now + _dt.timedelta(minutes=50)).strftime("%H:%M")
-            window_to   = (now + _dt.timedelta(minutes=70)).strftime("%H:%M")
+            window_from = now + timedelta(minutes=50)
+            window_to = now + timedelta(minutes=70)
 
-            with database.SessionLocal() as db:
-                # Запланированные поездки на сегодня в нужном окне времени
+            # Кандидатные даты (учитывает переход через полночь)
+            candidate_dates = list({window_from.date().isoformat(), window_to.date().isoformat()})
+
+            with SessionLocal() as db:
                 trips = db.query(models.Trip).filter(
                     models.Trip.status == "scheduled",
-                    models.Trip.date == today,
-                    models.Trip.time >= window_from,
-                    models.Trip.time <= window_to,
+                    models.Trip.date.in_(candidate_dates),
+                    models.Trip.reminder_sent == False,  # noqa: E712
                 ).all()
 
                 for trip in trips:
-                    if trip.reminder_sent:
-                        continue  # уже отправлено (персистентно в БД, не теряется при рестарте)
+                    if not trip.date or not trip.time:
+                        continue
 
-                    # --- Напоминаем ВОДИТЕЛЯ ---
+                    # Парсим дату и время поездки в часовом поясе Бишкека
+                    try:
+                        t_year, t_month, t_day = map(int, trip.date.split("-"))
+                        t_hour, t_min = map(int, trip.time.split(":"))
+                        trip_dt = datetime(t_year, t_month, t_day, t_hour, t_min, tzinfo=BISHKEK_TZ)
+                    except (ValueError, AttributeError):
+                        continue
+
+                    if not (window_from <= trip_dt <= window_to):
+                        continue
+
+                    # --- Напоминаем ВОДИТЕЛЮ ---
                     driver_user = db.query(models.User).filter(
                         models.User.id == trip.user_id
                     ).first()
@@ -1609,14 +1699,13 @@ async def _reminder_loop():
 
 
 async def startup_tasks():
-    """1. Удаляем просроченные active-поездки (дата уже прошла).
-    2. Регистрируем Telegram webhook.
+    """1. Удаляем просроченные active-поездки (дата уже прошла по Бишкеку).
+    2. Регистрируем Telegram webhook с secret_token.
     3. Запускаем фоновую задачу напоминаний за 1 час до поездки.
 
     НИКОГДА не трогаем scheduled-поездки — это будущие поездки, они важны.
     """
-    import datetime as _dt
-    today = _dt.date.today().isoformat()
+    today = get_bishkek_today_str()
 
     # --- Очистка просроченных active-поездок ---
     with database.SessionLocal() as db:
@@ -1626,8 +1715,7 @@ async def startup_tasks():
             models.Trip.date != None,
             models.Trip.date < today,
         ).all()
-        # Случай 2: дата не заполнена (legacy-записи без даты) — тоже считаем просроченными,
-        # если их ID ниже минимального ID поездки последних 7 дней (грубое, но без created_at лучше не сломать)
+        # Случай 2: дата не заполнена (legacy-записи без даты)
         stale_no_date = db.query(models.Trip).filter(
             models.Trip.status == "active",
             models.Trip.date == None,
@@ -1646,16 +1734,20 @@ async def startup_tasks():
 
     # --- Telegram webhook ---
     import os
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "8730455344:AAHQ3rj5r9kaGVTdDZH0T0CtMpwHyegNqMo")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://birge-backend.onrender.com")
     if not token or not render_url:
-        print("[Telegram] BOT_TOKEN или RENDER_EXTERNAL_URL не заданы — webhook не зарегистрирован")
+        print("[Telegram] TELEGRAM_BOT_TOKEN или RENDER_EXTERNAL_URL не заданы — webhook не зарегистрирован")
         return
     webhook_url = f"{render_url}/bot/webhook"
+    webhook_payload = {"url": webhook_url}
+    if TELEGRAM_WEBHOOK_SECRET:
+        webhook_payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+
     async with __import__('httpx').AsyncClient() as client:
         resp = await client.post(
             f"https://api.telegram.org/bot{token}/setWebhook",
-            json={"url": webhook_url}
+            json=webhook_payload
         )
         result = resp.json()
         if result.get("ok"):

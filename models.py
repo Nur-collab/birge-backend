@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Float, DateTime
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Float, DateTime, BigInteger
 from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime, timezone
@@ -21,7 +21,7 @@ class User(Base):
     car_plate = Column(String)
 
     trips = relationship("Trip", back_populates="user")
-    reviews = relationship("Review", back_populates="user")
+    reviews = relationship("Review", foreign_keys="[Review.user_id]", back_populates="user")
 
 class Trip(Base):
     __tablename__ = "trips"
@@ -46,11 +46,15 @@ class Review(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     author_name = Column(String)
+    trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
     text = Column(String)
     rating = Column(Integer)
 
-    user = relationship("User", back_populates="reviews")
+    user = relationship("User", foreign_keys=[user_id], back_populates="reviews")
+    author = relationship("User", foreign_keys=[author_id])
+    trip = relationship("Trip", foreign_keys=[trip_id])
 
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
@@ -87,18 +91,18 @@ class SmsCode(Base):
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String, index=True)
     code = Column(String)
-    expires_at = Column(DateTime)       # Когда код истекает (5 минут)
-    last_sent_at = Column(DateTime)     # Когда последний раз отправляли (rate limit)
+    expires_at = Column(DateTime(timezone=True))       # Когда код истекает (5 минут)
+    last_sent_at = Column(DateTime(timezone=True))     # Когда последний раз отправляли (rate limit)
     is_used = Column(Boolean, default=False)
+    attempts = Column(Integer, default=0)             # Счётчик неверных попыток (защита от brute-force)
 
 
 # Telegram: привязка номера телефона к chat_id
-# Заполняется когда пользователь шлёт /start <phone> боту
 class TelegramBinding(Base):
     __tablename__ = "telegram_bindings"
 
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String, unique=True, index=True)          # "+996 555 123 456" (читаемый формат)
     phone_normalized = Column(String, index=True)             # "996555123456" (только цифры, для быстрого поиска)
-    chat_id = Column(Integer, index=True)                     # Telegram chat_id пользователя
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    chat_id = Column(BigInteger, index=True)                  # Telegram chat_id (BigInteger для 64-бит ID в PostgreSQL)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
