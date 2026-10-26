@@ -9,6 +9,10 @@ import database, models, schemas, auth
 import random
 import asyncio
 import os
+import logging
+import html
+
+logger = logging.getLogger("birge")
 
 # Initialize DB tables
 models.Base.metadata.create_all(bind=database.engine)
@@ -39,6 +43,8 @@ def run_migrations():
                 "ALTER TABLE sms_codes ADD COLUMN attempts INTEGER DEFAULT 0",
                 "ALTER TABLE reviews ADD COLUMN author_id INTEGER",
                 "ALTER TABLE reviews ADD COLUMN trip_id INTEGER",
+                "ALTER TABLE users ADD COLUMN mbank_phone TEXT",
+                "ALTER TABLE users ADD COLUMN elkart_number TEXT",
             ]
         else:
             # PostgreSQL поддерживает IF NOT EXISTS
@@ -52,6 +58,8 @@ def run_migrations():
                 "ALTER TABLE sms_codes ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
                 "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS author_id INTEGER",
                 "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS trip_id INTEGER",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS mbank_phone TEXT",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS elkart_number TEXT",
             ]
         for sql in migrations:
             try:
@@ -227,9 +235,16 @@ def verify_code(req: VerifyCodePayload, db: Session = Depends(get_db)):
         .first()
     )
     if not user:
+        # Автоматическая верификация если контакт уже был подтверждён в Telegram боте
+        has_tg = db.query(models.TelegramBinding).filter(
+            (models.TelegramBinding.phone_normalized == p_digits)
+            | (models.TelegramBinding.phone == p_e164)
+            | (models.TelegramBinding.phone == p_formatted)
+        ).first()
         user = models.User(
             name=name or "Новый пользователь",
             phone=p_e164,
+            is_verified=bool(has_tg),
             photo=f"https://i.pravatar.cc/150?u={p_digits}"
         )
         db.add(user)
@@ -277,13 +292,36 @@ def read_current_user_trips(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Возвращает историю поездок пользователя."""
-    return (
+    """Возвращает историю поездок пользователя (и как водителя, и как пассажира)."""
+    created_trips = (
         db.query(models.Trip)
         .filter(models.Trip.user_id == current_user.id)
-        .order_by(models.Trip.id.desc())
         .all()
     )
+    created_ids = {t.id for t in created_trips}
+
+    # Поездки других водителей, где пользователь был принят или завершил поездку как пассажир
+    passenger_requests = (
+        db.query(models.TripRequest)
+        .filter(
+            models.TripRequest.requester_id == current_user.id,
+            models.TripRequest.status.in_(["accepted", "completed"]),
+        )
+        .all()
+    )
+    joined_trip_ids = [r.trip_id for r in passenger_requests if r.trip_id and r.trip_id not in created_ids]
+
+    joined_trips = []
+    if joined_trip_ids:
+        joined_trips = (
+            db.query(models.Trip)
+            .filter(models.Trip.id.in_(joined_trip_ids))
+            .all()
+        )
+
+    all_trips = created_trips + joined_trips
+    all_trips.sort(key=lambda t: t.id, reverse=True)
+    return all_trips
 
 
 @app.get("/users/me/active-trip")
@@ -292,14 +330,21 @@ def get_my_active_trip(
     db: Session = Depends(get_db),
 ):
     today = get_bishkek_today_str()
+    from sqlalchemy import or_ as _or
 
     # 1. Поездка, созданная самим пользователем (как водитель или пассажир)
+    # in_progress активна независимо от смены суток; active/matched — на сегодня или без даты
     trip = (
         db.query(models.Trip)
         .filter(
             models.Trip.user_id == current_user.id,
-            models.Trip.status.in_(["active", "matched", "in_progress"]),
-            models.Trip.date == today,
+            _or(
+                models.Trip.status == "in_progress",
+                (
+                    models.Trip.status.in_(["active", "matched"])
+                    & _or(models.Trip.date == today, models.Trip.date.is_(None))
+                ),
+            ),
         )
         .order_by(models.Trip.id.desc())
         .first()
@@ -525,11 +570,6 @@ def create_trip(trip: schemas.TripCreate, current_user: models.User = Depends(ge
     if trip.role == "driver":
         if user.trips_today >= 3:
             raise HTTPException(status_code=400, detail="Daily driver trip limit (3) exceeded")
-        
-        # Увеличиваем счетчик поездок только для водителя
-        user.trips_today += 1
-
-    db.commit()
 
     trip_data = trip.model_dump()
     trip_data["user_id"] = user.id
@@ -545,6 +585,8 @@ def create_trip(trip: schemas.TripCreate, current_user: models.User = Depends(ge
     filtered_data = {k: v for k, v in trip_data.items() if k in valid_trip_fields}
 
     new_trip = models.Trip(**filtered_data)
+    if trip.role == "driver":
+        user.trips_today += 1
     db.add(new_trip)
     db.commit()
     db.refresh(new_trip)
@@ -675,11 +717,12 @@ def find_matches(role: str, origin: str, destination: str, time: str, date: Opti
             my_hour, my_min = map(int, time.split(":"))
             t_hour, t_min = map(int, trip.time.split(":"))
             my_total = my_hour * 60 + my_min
+            t_total = t_hour * 60 + t_min
             diff = abs(my_total - t_total)
             circular_diff = min(diff, 1440 - diff)
             if circular_diff <= 30:
                 matches.append(trip)
-        except ValueError:
+        except (ValueError, AttributeError):
             pass
 
     return matches
@@ -709,8 +752,15 @@ class ConnectionManager:
 
     async def broadcast(self, message: str, trip_id: str):
         if trip_id in self.active_connections:
-            for connection in self.active_connections[trip_id]:
-                await connection.send_text(message)
+            dead_connections = []
+            for connection in list(self.active_connections[trip_id]):
+                try:
+                    await connection.send_text(message)
+                except Exception as e:
+                    logger.warning(f"[WS] Error broadcasting to client on trip {trip_id}: {e}")
+                    dead_connections.append(connection)
+            for dead in dead_connections:
+                self.disconnect(dead, trip_id)
 
 manager = ConnectionManager()
 
@@ -726,8 +776,8 @@ class SSEManager:
         self._queues: dict[int, list[asyncio.Queue]] = {}
 
     def subscribe(self, user_id: int) -> asyncio.Queue:
-        """Создаёт новую очередь и добавляет её в список для user_id."""
-        q: asyncio.Queue = asyncio.Queue()
+        """Создаёт новую ограниченную очередь и добавляет её в список для user_id."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=50)
         if user_id not in self._queues:
             self._queues[user_id] = []
         self._queues[user_id].append(q)
@@ -742,9 +792,19 @@ class SSEManager:
             self._queues.pop(user_id, None)
 
     async def push(self, user_id: int, data: str) -> None:
-        """Отправляет событие во все активные очереди пользователя."""
+        """Отправляет событие во все активные очереди пользователя (non-blocking)."""
         for q in list(self._queues.get(user_id, [])):
-            await q.put(data)
+            try:
+                q.put_nowait(data)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(data)
+                except asyncio.QueueFull:
+                    pass
 
 
 sse_manager = SSEManager()       # passenger: receives accept/decline events
@@ -769,17 +829,11 @@ async def driver_trip_request_events(
         raw_token = token
 
     if not raw_token:
-        return StreamingResponse(
-            iter(["event: error\ndata: unauthorized\n\n"]),
-            media_type="text/event-stream",
-        )
+        raise HTTPException(status_code=401, detail="Authentication token required")
 
     token_user_id = auth.verify_token(raw_token)
     if not token_user_id or token_user_id != driver_id:
-        return StreamingResponse(
-            iter(["event: error\ndata: forbidden\n\n"]),
-            media_type="text/event-stream",
-        )
+        raise HTTPException(status_code=403, detail="Access forbidden")
 
     q = driver_sse_manager.subscribe(driver_id)
 
@@ -819,17 +873,11 @@ async def trip_request_events(
         raw_token = token
 
     if not raw_token:
-        return StreamingResponse(
-            iter(["event: error\ndata: unauthorized\n\n"]),
-            media_type="text/event-stream"
-        )
+        raise HTTPException(status_code=401, detail="Authentication token required")
 
     token_user_id = auth.verify_token(raw_token)
     if not token_user_id or token_user_id != requester_id:
-        return StreamingResponse(
-            iter(["event: error\ndata: forbidden\n\n"]),
-            media_type="text/event-stream"
-        )
+        raise HTTPException(status_code=403, detail="Access forbidden")
 
     q = sse_manager.subscribe(requester_id)
 
@@ -859,19 +907,19 @@ def is_trip_participant(db: Session, trip_id: int, user_id: int) -> bool:
     # 1. Создатель поездки (водитель или пассажир)
     if trip.user_id == user_id:
         return True
-    # 2. Принятый пассажир в поездке водителя
+    # 2. Принятый или завершивший поездку пассажир
     accepted_as_passenger = db.query(models.TripRequest).filter(
         models.TripRequest.trip_id == trip_id,
         models.TripRequest.requester_id == user_id,
-        models.TripRequest.status == "accepted",
+        models.TripRequest.status.in_(["accepted", "completed"]),
     ).first()
     if accepted_as_passenger:
         return True
-    # 3. Водитель, принявший поездку пассажира
+    # 3. Водитель, принявший или завершивший поездку пассажира
     accepted_as_driver = db.query(models.TripRequest).filter(
         models.TripRequest.requester_trip_id == trip_id,
         models.TripRequest.driver_id == user_id,
-        models.TripRequest.status == "accepted",
+        models.TripRequest.status.in_(["accepted", "completed"]),
     ).first()
     return bool(accepted_as_driver)
 
@@ -948,6 +996,10 @@ async def websocket_endpoint(
             await manager.broadcast(json.dumps(response_data), trip_id)
 
     except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"[WS] WebSocket error on trip {trip_id}, user {user_id}: {e}")
+    finally:
         manager.disconnect(websocket, trip_id)
 
 
@@ -1012,7 +1064,8 @@ async def update_trip_status(
             models.TripRequest.status == "accepted",
         ).first()
         if req:
-            # Для пассажира поездка считается завершённой локально, не ломая статус всей поездки водителя
+            req.status = "completed"
+            db.commit()
             return {"id": trip_id, "status": "passenger_completed"}
 
     # --- Водитель управляет статусом ---
@@ -1049,10 +1102,18 @@ def cancel_trip(
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found or access denied")
 
+    # Безопасная очистка зависимых сущностей перед удалением
+    db.query(models.ChatMessage).filter(models.ChatMessage.trip_id == trip_id).delete(synchronize_session=False)
+    db.query(models.TripRequest).filter(
+        (models.TripRequest.trip_id == trip_id) | (models.TripRequest.requester_trip_id == trip_id)
+    ).delete(synchronize_session=False)
     db.delete(trip)
     db.commit()
     return {"id": trip_id, "deleted": True}
 
+
+# Кулдаун тревожной кнопки: trip_id -> datetime
+_last_panic_time: dict[int, datetime] = {}
 
 @app.post("/trips/{trip_id}/panic")
 async def send_panic_alert(
@@ -1066,6 +1127,15 @@ async def send_panic_alert(
     import os, httpx
 
     trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
+    if not trip or not is_trip_participant(db, trip_id, current_user.id):
+        raise HTTPException(status_code=403, detail="Только участник поездки может отправить сигнал тревоги")
+
+    # Защита от флуда и исчерпания лимитов Telegram API (кулдаун 30 сек)
+    now_utc = datetime.now(timezone.utc)
+    last_sent = _last_panic_time.get(trip_id)
+    if last_sent and (now_utc - last_sent).total_seconds() < 30:
+        raise HTTPException(status_code=429, detail="Сигнал тревоги уже отправлен. Пожалуйста, подождите.")
+    _last_panic_time[trip_id] = now_utc
 
     admin_chat_id = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -1080,17 +1150,23 @@ async def send_panic_alert(
     if not admin_chat_id:
         return {"sent": False, "reason": "no_chat_id"}
 
+    safe_name = html.escape(current_user.name or "Пользователь")
+    safe_phone = html.escape(current_user.phone or "")
+    safe_origin = html.escape(trip.origin or "")
+    safe_dest = html.escape(trip.destination or "")
+    safe_time = html.escape(trip.time or "")
+
     msg_parts = [
-        "🚨 *ТРЕВОГА — ПАССАЖИР В ОПАСНОСТИ!*",
+        "🚨 <b>ТРЕВОГА — ПАССАЖИР В ОПАСНОСТИ!</b>",
         "",
-        f"👤 *{current_user.name}*",
-        f"📱 `{current_user.phone}`",
-        f"🚗 Поездка #*{trip_id}*",
+        f"👤 <b>{safe_name}</b>",
+        f"📱 <code>{safe_phone}</code>",
+        f"🚗 Поездка #<b>{trip_id}</b>",
+        f"📍 {safe_origin} → {safe_dest}",
+        f"🕐 {safe_time}",
+        "",
+        "⚠️ Срочно свяжитесь с пассажиром!",
     ]
-    if trip:
-        msg_parts.append(f"📍 {trip.origin} → {trip.destination}")
-        msg_parts.append(f"🕐 {trip.time}")
-    msg_parts += ["", "⚠️ Срочно свяжитесь с пассажиром!"]
     message = "\n".join(msg_parts)
 
     try:
@@ -1100,7 +1176,7 @@ async def send_panic_alert(
                 json={
                     "chat_id": admin_chat_id,
                     "text": message,
-                    "parse_mode": "Markdown",
+                    "parse_mode": "HTML",
                 },
             )
         return {"sent": resp.status_code == 200}
@@ -1124,9 +1200,17 @@ def create_review(
     if review.user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot review yourself")
 
-    user = db.query(models.User).filter(models.User.id == review.user_id).first()
+    user = db.query(models.User).filter(models.User.id == review.user_id).with_for_update().first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Проверка совместной поездки: автор и рецензируемый должны быть участниками trip_id
+    if review.trip_id:
+        if not is_trip_participant(db, review.trip_id, current_user.id) or not is_trip_participant(db, review.trip_id, review.user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Отзыв можно оставить только после совместной поездки",
+            )
 
     # Защита от дублирующих отзывов: проверяем по author_id и author_name
     query = db.query(models.Review).filter(
@@ -1178,7 +1262,16 @@ async def send_trip_request(
     trip_id = req_in.trip_id                     # ID поездки водителя
     requester_trip_id = req_in.requester_trip_id # ID поездки пассажира
     requester_id = current_user.id               # ID пассажира — только из токена!
-    driver_id = req_in.driver_id                 # ID водителя
+
+    driver_trip = db.query(models.Trip).filter(models.Trip.id == trip_id).first()
+    if not driver_trip:
+        raise HTTPException(status_code=404, detail="Поездка не найдена")
+    if driver_trip.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Нельзя отправить запрос на собственную поездку")
+    if (driver_trip.seats_taken or 0) >= (driver_trip.seats or 3):
+        raise HTTPException(status_code=400, detail="В автомобиле не осталось свободных мест")
+
+    driver_id = driver_trip.user_id              # Берём строго из БД, а не из клиентского пейлоада
 
     # Проверяем, не отправлял ли уже активную заявку
     existing = db.query(models.TripRequest).filter(
@@ -1311,14 +1404,22 @@ async def respond_to_request(
 
     driver = current_user  # уже загружен через Depends
 
-    # Если принят — увеличиваем счётчик мест явно
+    # Если принят — увеличиваем счётчик мест явно с блокировкой строки от овербукинга
     if new_status == "accepted":
-        trip = db.query(models.Trip).filter(models.Trip.id == req.trip_id).first()
-        if trip:
-            trip.seats_taken = (trip.seats_taken or 0) + 1
-            # Если все места заняты — закрываем набор
-            if trip.seats_taken >= (trip.seats or 3):
-                trip.status = "matched"
+        trip = (
+            db.query(models.Trip)
+            .filter(models.Trip.id == req.trip_id)
+            .with_for_update()
+            .first()
+        )
+        if not trip:
+            raise HTTPException(status_code=404, detail="Trip not found")
+        if (trip.seats_taken or 0) >= (trip.seats or 3):
+            raise HTTPException(status_code=400, detail="Все места в автомобиле уже заняты")
+        trip.seats_taken = (trip.seats_taken or 0) + 1
+        # Если все места заняты — закрываем набор
+        if trip.seats_taken >= (trip.seats or 3):
+            trip.status = "matched"
 
     db.commit()
 
@@ -1428,8 +1529,11 @@ async def telegram_webhook(
       - Передачу контакта через кнопку «Поделиться номером» (с проверкой ownership)
       - Команды /status, /check, /test, /help
     """
+    import secrets
     if TELEGRAM_WEBHOOK_SECRET:
-        if x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+        if not x_telegram_bot_api_secret_token or not secrets.compare_digest(
+            x_telegram_bot_api_secret_token, TELEGRAM_WEBHOOK_SECRET
+        ):
             raise HTTPException(status_code=403, detail="Forbidden: Invalid webhook secret")
 
     message = payload.get("message", {})
@@ -1765,25 +1869,32 @@ async def startup_tasks():
     today = get_bishkek_today_str()
 
     # --- Очистка просроченных active-поездок ---
-    with database.SessionLocal() as db:
-        # Случай 1: дата поездки < сегодня (вчерашние и старше)
-        stale = db.query(models.Trip).filter(
-            models.Trip.status == "active",
-            models.Trip.date != None,
-            models.Trip.date < today,
-        ).all()
-        # Случай 2: дата не заполнена (legacy-записи без даты)
-        stale_no_date = db.query(models.Trip).filter(
-            models.Trip.status == "active",
-            models.Trip.date == None,
-        ).all()
-        all_stale = stale + stale_no_date
-        count = len(all_stale)
-        for trip in all_stale:
-            db.delete(trip)
-        if count:
-            db.commit()
-            print(f"[Startup] Удалено {count} просроченных active-поездок")
+    try:
+        with database.SessionLocal() as db:
+            # Случай 1: дата поездки < сегодня (вчерашние и старше)
+            stale = db.query(models.Trip).filter(
+                models.Trip.status == "active",
+                models.Trip.date != None,
+                models.Trip.date < today,
+            ).all()
+            # Случай 2: дата не заполнена (legacy-записи без даты)
+            stale_no_date = db.query(models.Trip).filter(
+                models.Trip.status == "active",
+                models.Trip.date == None,
+            ).all()
+            all_stale = stale + stale_no_date
+            count = len(all_stale)
+            if count:
+                stale_ids = [t.id for t in all_stale]
+                db.query(models.ChatMessage).filter(models.ChatMessage.trip_id.in_(stale_ids)).delete(synchronize_session=False)
+                db.query(models.TripRequest).filter(
+                    models.TripRequest.trip_id.in_(stale_ids) | models.TripRequest.requester_trip_id.in_(stale_ids)
+                ).delete(synchronize_session=False)
+                db.query(models.Trip).filter(models.Trip.id.in_(stale_ids)).delete(synchronize_session=False)
+                db.commit()
+                print(f"[Startup] Удалено {count} просроченных active-поездок")
+    except Exception as e:
+        logger.error(f"[Startup] Ошибка при очистке просроченных поездок: {e}")
 
     # --- Запуск фоновой задачи напоминаний ---
     asyncio.create_task(_reminder_loop())

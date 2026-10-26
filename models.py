@@ -19,6 +19,8 @@ class User(Base):
     car_model = Column(String)
     car_color = Column(String)
     car_plate = Column(String)
+    mbank_phone = Column(String)
+    elkart_number = Column(String)
 
     trips = relationship("Trip", back_populates="user")
     reviews = relationship("Review", foreign_keys="[Review.user_id]", back_populates="user")
@@ -48,7 +50,7 @@ class Review(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     author_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     author_name = Column(String)
-    trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
+    trip_id = Column(Integer, ForeignKey("trips.id", ondelete="CASCADE"), nullable=True)
     text = Column(String)
     rating = Column(Integer)
 
@@ -60,7 +62,7 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id = Column(Integer, primary_key=True, index=True)
-    trip_id = Column(Integer, ForeignKey("trips.id"))
+    trip_id = Column(Integer, ForeignKey("trips.id", ondelete="CASCADE"))
     sender_id = Column(Integer, ForeignKey("users.id"))
     text = Column(String)
     timestamp = Column(String)
@@ -73,8 +75,8 @@ class TripRequest(Base):
     __tablename__ = "trip_requests"
 
     id = Column(Integer, primary_key=True, index=True)
-    trip_id = Column(Integer, ForeignKey("trips.id"))            # поездка водителя
-    requester_trip_id = Column(Integer, ForeignKey("trips.id"))  # поездка пассажира
+    trip_id = Column(Integer, ForeignKey("trips.id", ondelete="CASCADE"))            # поездка водителя
+    requester_trip_id = Column(Integer, ForeignKey("trips.id", ondelete="CASCADE"))  # поездка пассажира
     requester_id = Column(Integer, ForeignKey("users.id"))       # кто запрашивает
     driver_id = Column(Integer, ForeignKey("users.id"))          # кому адресован запрос
     status = Column(String, default="pending")                   # pending, accepted, declined

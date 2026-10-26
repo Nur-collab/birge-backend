@@ -46,6 +46,8 @@ class UserBase(BaseModel):
     car_model: Optional[str] = None
     car_color: Optional[str] = None
     car_plate: Optional[str] = None
+    mbank_phone: Optional[str] = None
+    elkart_number: Optional[str] = None
 
 class UserPublic(BaseModel):
     """Публичный профиль без номера телефона (защита от утечки в поиске и чате)."""
@@ -57,6 +59,8 @@ class UserPublic(BaseModel):
     car_model: Optional[str] = None
     car_color: Optional[str] = None
     car_plate: Optional[str] = None
+    mbank_phone: Optional[str] = None
+    elkart_number: Optional[str] = None
     registered_since: Optional[str] = "2024"
 
     model_config = ConfigDict(from_attributes=True)
@@ -67,6 +71,8 @@ class UserUpdate(BaseModel):
     car_model: Optional[str] = None
     car_color: Optional[str] = None
     car_plate: Optional[str] = None
+    mbank_phone: Optional[str] = None
+    elkart_number: Optional[str] = None
 
 class UserCreate(UserBase):
     pass
