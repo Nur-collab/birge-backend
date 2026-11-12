@@ -230,6 +230,62 @@ class FlowTests(unittest.TestCase):
             ))
         self.assertEqual(ctx.exception.status_code, 403)
 
+    def test_cleanup_stale_trips_auto_completes_driver_with_passengers(self):
+        yesterday = (datetime.strptime(self.today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        driver_trip = self._trip(self.driver, trip_date=yesterday, status="active", seats=3, seats_taken=1)
+        passenger_trip = self._trip(self.passenger, role="passenger", trip_date=yesterday, status="active")
+        req = self._request(driver_trip, self.passenger, requester_trip=passenger_trip, status="accepted")
+
+        stats = main.cleanup_stale_trips(self.db)
+        self.db.refresh(driver_trip)
+        self.db.refresh(passenger_trip)
+        self.db.refresh(req)
+
+        self.assertEqual(driver_trip.status, "completed")
+        self.assertEqual(passenger_trip.status, "completed")
+        self.assertEqual(req.status, "completed")
+        self.assertEqual(stats["completed_driver_trips"], 1)
+
+    def test_cleanup_stale_trips_cancels_empty_driver_trip(self):
+        yesterday = (datetime.strptime(self.today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        driver_trip = self._trip(self.driver, trip_date=yesterday, status="active", seats=3, seats_taken=0)
+        pending_req = self._request(driver_trip, self.passenger, status="pending")
+
+        stats = main.cleanup_stale_trips(self.db)
+        self.db.refresh(driver_trip)
+        self.db.refresh(pending_req)
+
+        self.assertEqual(driver_trip.status, "cancelled")
+        self.assertEqual(pending_req.status, "declined")
+        self.assertEqual(stats["cancelled_driver_trips"], 1)
+        self.assertEqual(stats["declined_stale_requests"], 1)
+
+    def test_cleanup_stale_trips_ignores_future_scheduled_trip(self):
+        driver_trip = self._trip(self.driver, trip_date=self.tomorrow, status="scheduled", seats=3, seats_taken=1)
+        passenger_trip = self._trip(self.passenger, role="passenger", trip_date=self.tomorrow, status="scheduled")
+        req = self._request(driver_trip, self.passenger, requester_trip=passenger_trip, status="accepted")
+
+        stats = main.cleanup_stale_trips(self.db)
+        self.db.refresh(driver_trip)
+        self.db.refresh(passenger_trip)
+        self.db.refresh(req)
+
+        self.assertEqual(driver_trip.status, "scheduled")
+        self.assertEqual(passenger_trip.status, "scheduled")
+        self.assertEqual(req.status, "accepted")
+        self.assertEqual(stats["completed_driver_trips"], 0)
+        self.assertEqual(stats["cancelled_driver_trips"], 0)
+
+    def test_cleanup_stale_trips_cancels_stale_passenger_search(self):
+        yesterday = (datetime.strptime(self.today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        passenger_trip = self._trip(self.passenger, role="passenger", trip_date=yesterday, status="active")
+
+        stats = main.cleanup_stale_trips(self.db)
+        self.db.refresh(passenger_trip)
+
+        self.assertEqual(passenger_trip.status, "cancelled")
+        self.assertEqual(stats["cancelled_passenger_trips"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2323,46 +2323,238 @@ async def _reminder_loop():
             print(f"[Reminder] Ошибка в цикле: {e}")
 
 
-async def startup_tasks():
-    """1. Удаляем просроченные active-поездки (дата уже прошла по Бишкеку).
-    2. Регистрируем Telegram webhook с secret_token.
-    3. Запускаем фоновую задачу напоминаний за 1 час до поездки.
+def _get_trip_datetime(trip: models.Trip) -> Optional[datetime]:
+    """Возвращает datetime поездки в часовом поясе Бишкека (BISHKEK_TZ)."""
+    if not trip.date:
+        return None
+    try:
+        parts = [int(p) for p in str(trip.date).strip().split("-") if p.isdigit()]
+        if len(parts) != 3:
+            return None
+        y, m, d = parts
+        tm = parse_time_minutes(trip.time)
+        h, mn = (tm // 60, tm % 60) if tm is not None else (23, 59)
+        return datetime(y, m, d, h, mn, tzinfo=BISHKEK_TZ)
+    except Exception:
+        return None
 
-    НИКОГДА не трогаем scheduled-поездки — это будущие поездки, они важны.
+
+def cleanup_stale_trips(db: Session) -> dict[str, int]:
+    """Периодическая автоочистка и архивация старых поездок:
+    1. Поездки водителей с пассажирами (время вышло > 4ч назад):
+       - Переводятся в 'completed' (сохраняет историю поездок и отзывы).
+       - Принятые пассажирские запросы переходят в 'completed'.
+       - Привязанные поездки пассажиров переходят в 'completed'.
+       - Висящие 'pending' запросы закрываются как 'declined'.
+    2. Поездки водителей без пассажиров (время вышло > 5ч назад):
+       - Переводятся в 'cancelled'.
+       - Висящие 'pending' запросы закрываются как 'declined'.
+    3. Неактуальные поиски пассажиров (время вышло > 4ч назад):
+       - Переводятся в 'cancelled'.
+       - Исходящие 'pending' запросы отклоняются.
+    4. Физическая очистка древних cancelled записей (> 14 дней без сообщений и отзывов).
     """
-    today = get_bishkek_today_str()
+    now_bishkek = get_bishkek_now()
+    now_utc = datetime.now(timezone.utc)
+    stats = {
+        "completed_driver_trips": 0,
+        "cancelled_driver_trips": 0,
+        "cancelled_passenger_trips": 0,
+        "declined_stale_requests": 0,
+        "pruned_legacy_trips": 0,
+    }
 
-    # --- Очистка просроченных active-поездок ---
+    try:
+        candidate_trips = db.query(models.Trip).filter(
+            models.Trip.status.in_(["active", "scheduled", "matched", "in_progress"])
+        ).all()
+
+        stale_driver_completed: list[models.Trip] = []
+        stale_driver_cancelled: list[models.Trip] = []
+        stale_passenger_cancelled: list[models.Trip] = []
+
+        for trip in candidate_trips:
+            buffer_hours = 12 if trip.status == "in_progress" else 4
+            trip_dt = _get_trip_datetime(trip)
+
+            is_stale = False
+            if trip_dt:
+                if now_bishkek - trip_dt >= timedelta(hours=buffer_hours):
+                    is_stale = True
+            elif trip.created_at:
+                created_utc = trip.created_at if trip.created_at.tzinfo else trip.created_at.replace(tzinfo=timezone.utc)
+                if now_utc - created_utc >= timedelta(hours=buffer_hours):
+                    is_stale = True
+            elif trip.date and trip.date < now_bishkek.date().isoformat():
+                is_stale = True
+
+            if not is_stale:
+                continue
+
+            if trip.role == "driver":
+                has_passengers = bool(trip.seats_taken and trip.seats_taken > 0)
+                if not has_passengers:
+                    has_passengers = db.query(models.TripRequest).filter(
+                        models.TripRequest.trip_id == trip.id,
+                        models.TripRequest.status.in_(["accepted", "completed"]),
+                    ).first() is not None
+
+                if has_passengers:
+                    stale_driver_completed.append(trip)
+                else:
+                    stale_driver_cancelled.append(trip)
+            else:
+                stale_passenger_cancelled.append(trip)
+
+        # 1. Завершаем поездки водителей с пассажирами
+        for d_trip in stale_driver_completed:
+            d_trip.status = "completed"
+            stats["completed_driver_trips"] += 1
+
+            accepted_reqs = db.query(models.TripRequest).filter(
+                models.TripRequest.trip_id == d_trip.id,
+                models.TripRequest.status == "accepted",
+            ).all()
+            for req in accepted_reqs:
+                req.status = "completed"
+                if req.requester_trip_id:
+                    p_trip = db.query(models.Trip).filter(models.Trip.id == req.requester_trip_id).first()
+                    if p_trip and p_trip.status not in ("completed", "cancelled"):
+                        p_trip.status = "completed"
+
+            pending_reqs = db.query(models.TripRequest).filter(
+                models.TripRequest.trip_id == d_trip.id,
+                models.TripRequest.status == "pending",
+            ).all()
+            for p_req in pending_reqs:
+                p_req.status = "declined"
+                stats["declined_stale_requests"] += 1
+
+        # 2. Отменяем несостоявшиеся поездки водителей
+        for d_trip in stale_driver_cancelled:
+            d_trip.status = "cancelled"
+            stats["cancelled_driver_trips"] += 1
+
+            pending_reqs = db.query(models.TripRequest).filter(
+                models.TripRequest.trip_id == d_trip.id,
+                models.TripRequest.status == "pending",
+            ).all()
+            for p_req in pending_reqs:
+                p_req.status = "declined"
+                stats["declined_stale_requests"] += 1
+
+        # 3. Отменяем устаревшие поиски пассажиров
+        for p_trip in stale_passenger_cancelled:
+            was_accepted = db.query(models.TripRequest).filter(
+                models.TripRequest.requester_trip_id == p_trip.id,
+                models.TripRequest.status.in_(["accepted", "completed"]),
+            ).first()
+            if was_accepted:
+                continue
+
+            p_trip.status = "cancelled"
+            stats["cancelled_passenger_trips"] += 1
+
+            out_pending = db.query(models.TripRequest).filter(
+                models.TripRequest.requester_trip_id == p_trip.id,
+                models.TripRequest.status == "pending",
+            ).all()
+            for req in out_pending:
+                req.status = "declined"
+                stats["declined_stale_requests"] += 1
+
+        # 4. Физическая очистка древних cancelled записей (> 14 дней без сообщений и отзывов)
+        cutoff_date = (now_bishkek - timedelta(days=14)).date().isoformat()
+        cutoff_utc = now_utc - timedelta(days=14)
+
+        legacy_trips = db.query(models.Trip).filter(
+            models.Trip.status == "cancelled",
+            (
+                (models.Trip.date.is_not(None) & (models.Trip.date < cutoff_date))
+                | (models.Trip.created_at.is_not(None) & (models.Trip.created_at < cutoff_utc))
+            ),
+        ).limit(100).all()
+
+        if legacy_trips:
+            legacy_ids = [t.id for t in legacy_trips]
+            chat_trip_ids = {
+                m.trip_id for m in db.query(models.ChatMessage.trip_id).filter(
+                    models.ChatMessage.trip_id.in_(legacy_ids)
+                ).all()
+            }
+            review_trip_ids = {
+                r.trip_id for r in db.query(models.Review.trip_id).filter(
+                    models.Review.trip_id.in_(legacy_ids)
+                ).all()
+            }
+            safe_to_delete = [
+                tid for tid in legacy_ids
+                if tid not in chat_trip_ids and tid not in review_trip_ids
+            ]
+            if safe_to_delete:
+                db.query(models.TripRequest).filter(
+                    models.TripRequest.trip_id.in_(safe_to_delete)
+                    | models.TripRequest.requester_trip_id.in_(safe_to_delete)
+                ).delete(synchronize_session=False)
+                deleted_count = db.query(models.Trip).filter(
+                    models.Trip.id.in_(safe_to_delete)
+                ).delete(synchronize_session=False)
+                stats["pruned_legacy_trips"] = deleted_count
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[cleanup_stale_trips] Ошибка транзакции: {e}", exc_info=True)
+        raise
+
+    return stats
+
+
+async def _stale_cleanup_loop():
+    """Фоновая периодическая автоочистка старых поездок (каждые 15 минут)."""
+    while True:
+        try:
+            await asyncio.sleep(900)  # 15 минут
+            with database.SessionLocal() as db:
+                stats = cleanup_stale_trips(db)
+                total_actions = sum(stats.values())
+                if total_actions > 0:
+                    logger.info(f"[AutoCleanup] Периодическая очистка выполнена: {stats}")
+                    print(f"[AutoCleanup] ✅ Выполнена автоочистка поездок: {stats}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[AutoCleanup] Ошибка в цикле автоочистки: {e}")
+            print(f"[AutoCleanup] ⚠️ Ошибка: {e}")
+
+
+@app.post("/admin/cleanup-trips")
+def run_admin_cleanup(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Принудительный запуск очистки старых поездок администратором."""
+    stats = cleanup_stale_trips(db)
+    return {"ok": True, "stats": stats}
+
+
+async def startup_tasks():
+    """1. Автоочистка и архивация просроченных поездок.
+    2. Запуск периодического цикла автоочистки каждые 15 минут.
+    3. Запуск фоновой задачи напоминаний за 1 час до поездки.
+    4. Регистрация Telegram webhook с secret_token.
+    """
+    # --- Автоочистка просроченных поездок при старте ---
     try:
         with database.SessionLocal() as db:
-            # Случай 1: дата поездки < сегодня (вчерашние и старше)
-            stale = db.query(models.Trip).filter(
-                models.Trip.status == "active",
-                models.Trip.date.is_not(None),
-                models.Trip.date < today,
-            ).all()
-            # Случай 2: legacy-записи без даты. Удаляем только реально старые
-            # (старше 6 часов), чтобы рестарт не стирал активный поиск «сейчас».
-            cutoff = datetime.utcnow() - timedelta(hours=6)
-            stale_no_date = db.query(models.Trip).filter(
-                models.Trip.status == "active",
-                models.Trip.date.is_(None),
-                models.Trip.created_at.is_not(None),
-                models.Trip.created_at < cutoff,
-            ).all()
-            all_stale = stale + stale_no_date
-            count = len(all_stale)
-            if count:
-                stale_ids = [t.id for t in all_stale]
-                db.query(models.ChatMessage).filter(models.ChatMessage.trip_id.in_(stale_ids)).delete(synchronize_session=False)
-                db.query(models.TripRequest).filter(
-                    models.TripRequest.trip_id.in_(stale_ids) | models.TripRequest.requester_trip_id.in_(stale_ids)
-                ).delete(synchronize_session=False)
-                db.query(models.Trip).filter(models.Trip.id.in_(stale_ids)).delete(synchronize_session=False)
-                db.commit()
-                print(f"[Startup] Удалено {count} просроченных active-поездок")
+            startup_stats = cleanup_stale_trips(db)
+            print(f"[Startup] ✅ Автоочистка поездок выполнена: {startup_stats}")
     except Exception as e:
-        logger.error(f"[Startup] Ошибка при очистке просроченных поездок: {e}")
+        logger.error(f"[Startup] Ошибка при автоочистке: {e}")
+
+    # --- Запуск периодического цикла автоочистки ---
+    asyncio.create_task(_stale_cleanup_loop())
+    print("[AutoCleanup] ✅ Фоновая задача автоочистки поездок запущена (проверка каждые 15 минут)")
 
     # --- Запуск фоновой задачи напоминаний ---
     asyncio.create_task(_reminder_loop())
