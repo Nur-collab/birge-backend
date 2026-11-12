@@ -2211,6 +2211,43 @@ async def telegram_webhook(
         return {"ok": True}
 
 
+@app.get("/internal/get-binding")
+def internal_get_binding(
+    phone: str,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(None, alias="X-Telegram-Bot-Api-Secret-Token"),
+    db: Session = Depends(get_db),
+):
+    """Внутренний защищенный эндпоинт для синхронизации привязок Telegram между локальным dev и production."""
+    import secrets
+    if not TELEGRAM_WEBHOOK_SECRET or not x_telegram_bot_api_secret_token or not secrets.compare_digest(
+        x_telegram_bot_api_secret_token, TELEGRAM_WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid secret")
+
+    phone_digits = "".join(filter(str.isdigit, phone or ""))
+    if not phone_digits:
+        return {"found": False}
+
+    binding = (
+        db.query(models.TelegramBinding)
+        .filter(
+            (models.TelegramBinding.phone_normalized == phone_digits)
+            | (models.TelegramBinding.phone == phone)
+            | (models.TelegramBinding.phone_normalized.endswith(phone_digits[-9:]))
+        )
+        .first()
+    )
+    if not binding:
+        return {"found": False}
+
+    return {
+        "found": True,
+        "phone": binding.phone,
+        "phone_normalized": binding.phone_normalized,
+        "chat_id": binding.chat_id,
+    }
+
+
 # Глобальный in-memory set удалён — состояние теперь хранится в БД (Trip.reminder_sent).
 # Это означает что напоминания не дублируются при рестарте сервера.
 

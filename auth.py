@@ -135,6 +135,37 @@ def get_telegram_chat_id(phone: str, db) -> Optional[int]:
     if old_bindings:
         db.commit()
 
+    # Fallback на Render для локальной разработки (когда webhook Telegram приходит на прод)
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    is_prod = bool(os.environ.get("RENDER")) or os.environ.get("ENVIRONMENT", "").lower() == "production"
+
+    if not is_prod and render_url and webhook_secret:
+        try:
+            import urllib.request, json
+            req = urllib.request.Request(
+                f"{render_url}/internal/get-binding?phone={phone_digits}",
+                headers={"X-Telegram-Bot-Api-Secret-Token": webhook_secret},
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if data.get("found") and data.get("chat_id"):
+                        remote_chat_id = int(data["chat_id"])
+                        new_b = TelegramBinding(
+                            phone=data.get("phone") or phone,
+                            phone_normalized=data.get("phone_normalized") or phone_digits,
+                            chat_id=remote_chat_id,
+                        )
+                        db.add(new_b)
+                        try:
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                        return remote_chat_id
+        except Exception:
+            pass
+
     return None
 
 
