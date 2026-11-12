@@ -203,6 +203,10 @@ _SEND_CODE_WINDOW_SECONDS = 600
 _SEND_CODE_MAX_PER_WINDOW = 10
 _send_code_attempts: dict[str, list[float]] = {}
 
+_VERIFY_CODE_WINDOW_SECONDS = 60
+_VERIFY_CODE_MAX_PER_WINDOW = 15
+_verify_code_attempts: dict[str, list[float]] = {}
+
 def _client_ip(request: Request) -> str:
     """IP клиента с учётом прокси Render; нужен только для анти-спам лимита."""
     forwarded = request.headers.get("x-forwarded-for", "")
@@ -210,13 +214,31 @@ def _client_ip(request: Request) -> str:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
+def _prune_rate_dict(d: dict[str, list[float]], window_seconds: int) -> None:
+    """Очищает устаревшие IP из словаря лимитов, предотвращая утечку памяти."""
+    now = time.time()
+    if len(d) > 200:
+        expired_keys = [k for k, timestamps in d.items() if not timestamps or (now - timestamps[-1] > window_seconds)]
+        for k in expired_keys:
+            d.pop(k, None)
+
 def _check_send_code_rate(ip: str) -> None:
     now = time.time()
+    _prune_rate_dict(_send_code_attempts, _SEND_CODE_WINDOW_SECONDS)
     attempts = [t for t in _send_code_attempts.get(ip, []) if now - t < _SEND_CODE_WINDOW_SECONDS]
     if len(attempts) >= _SEND_CODE_MAX_PER_WINDOW:
         raise HTTPException(status_code=429, detail="Слишком много запросов кода. Попробуйте позже.")
     attempts.append(now)
     _send_code_attempts[ip] = attempts
+
+def _check_verify_code_rate(ip: str) -> None:
+    now = time.time()
+    _prune_rate_dict(_verify_code_attempts, _VERIFY_CODE_WINDOW_SECONDS)
+    attempts = [t for t in _verify_code_attempts.get(ip, []) if now - t < _VERIFY_CODE_WINDOW_SECONDS]
+    if len(attempts) >= _VERIFY_CODE_MAX_PER_WINDOW:
+        raise HTTPException(status_code=429, detail="Слишком много попыток ввода кода. Подождите минуту.")
+    attempts.append(now)
+    _verify_code_attempts[ip] = attempts
 
 @app.post("/auth/send-code")
 async def send_code(req: schemas.SendCodeRequest, request: Request, db: Session = Depends(get_db)):
@@ -265,8 +287,9 @@ async def send_code(req: schemas.SendCodeRequest, request: Request, db: Session 
     return {"message": f"Code sent via {channel}", "tg_linked": bool(chat_id)}
 
 @app.post("/auth/verify-code")
-def verify_code(req: VerifyCodePayload, db: Session = Depends(get_db)):
+def verify_code(req: VerifyCodePayload, request: Request, db: Session = Depends(get_db)):
     """Проверяет SMS-код и выдает JWT токен."""
+    _check_verify_code_rate(_client_ip(request))
     raw_phone = req.phone.strip()
     code = req.code.strip()
     name = (req.name or "").strip()
