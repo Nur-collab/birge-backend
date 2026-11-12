@@ -90,7 +90,8 @@ async def main():
                     # Обрабатываем сообщение через логику telegram_webhook
                     db = SessionLocal()
                     try:
-                        await telegram_webhook(update, db)
+                        secret_token = os.environ.get("TELEGRAM_WEBHOOK_SECRET", None)
+                        await telegram_webhook(payload=update, x_telegram_bot_api_secret_token=secret_token, db=db)
                     except Exception as e:
                         print(f"[!] Ошибка обработки: {e}")
                     finally:

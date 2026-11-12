@@ -40,6 +40,7 @@ class Trip(Base):
     seats_taken = Column(Integer, default=0)   # занято мест
     price_per_seat = Column(Integer, default=0) # стоимость одного места в сомах (0 = бесплатно)
     reminder_sent = Column(Boolean, default=False) # True = напоминание уже отправлено (не повторяем при рестарте)
+    created_at = Column(DateTime, default=lambda: datetime.utcnow())  # UTC, для очистки legacy-поисков
 
     user = relationship("User", back_populates="trips")
 
