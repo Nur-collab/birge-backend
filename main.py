@@ -80,6 +80,7 @@ def run_migrations():
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS date TEXT",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS price_per_seat INTEGER DEFAULT 0",
                 "ALTER TABLE telegram_bindings ADD COLUMN IF NOT EXISTS phone_normalized TEXT",
+                "ALTER TABLE telegram_bindings ALTER COLUMN chat_id TYPE BIGINT",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE",
                 "ALTER TABLE trips ADD COLUMN IF NOT EXISTS created_at TIMESTAMP",
                 "ALTER TABLE sms_codes ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
@@ -1959,224 +1960,255 @@ async def telegram_webhook(
     ):
         raise HTTPException(status_code=403, detail="Forbidden: Invalid webhook secret")
 
-    message = payload.get("message", {})
-    if not message:
-        return {"ok": True}
-
-    chat_id: int = message.get("chat", {}).get("id")
-    text: str = (message.get("text") or "").strip()
-    contact: dict = message.get("contact", {})
-    sender: dict = message.get("from", {})
-    first_name: str = sender.get("first_name", "Пользователь")
-    username: str = sender.get("username", "")
-
-    if not chat_id:
-        return {"ok": True}
-
-    main_keyboard = {
-        "keyboard": [
-            [{"text": "📱 Поделиться номером", "request_contact": True}],
-            [{"text": "🔍 Проверить статус"}, {"text": "🔔 Тест связи"}],
-            [{"text": "❓ Помощь"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-    }
-
-    async def _reply(reply_text: str, custom_kb: dict | None = main_keyboard) -> None:
-        await auth.send_telegram_message(chat_id, reply_text, reply_markup=custom_kb)
-
-    async def _process_phone_binding(raw_phone: str) -> None:
-        is_valid, p_e164, p_digits, p_formatted, op_or_err = auth.normalize_kg_phone(raw_phone)
-        if not is_valid:
-            await _reply(
-                f"❌ *Ошибка в номере телефона:*\n{op_or_err}\n\n"
-                f"💡 Пример: `0555 123 456` или `+996 555 123 456`."
-            )
-            return
-
-        from models import TelegramBinding, User
-        # 1. Проверяем наличие пользователя в БД Birge
-        user = (
-            db.query(User)
-            .filter(
-                (User.phone == p_formatted)
-                | (User.phone == p_e164)
-                | (User.phone == p_digits)
-                | (User.phone.like(f"%{p_digits[-9:]}%"))
-            )
-            .first()
-        )
-
-        # 2. Сохраняем/обновляем привязку Telegram
-        binding = db.query(TelegramBinding).filter(
-            (TelegramBinding.phone_normalized == p_digits)
-            | (TelegramBinding.phone == p_formatted)
-            | (TelegramBinding.phone == p_e164)
-        ).first()
-
-        if binding:
-            binding.chat_id = chat_id
-            binding.phone = p_formatted
-            binding.phone_normalized = p_digits
-        else:
-            binding = TelegramBinding(
-                phone=p_formatted,
-                phone_normalized=p_digits,
-                chat_id=chat_id,
-            )
-            db.add(binding)
-
-        if user:
-            user.is_verified = True
-
-        db.commit()
-
-        if user:
-            await _reply(
-                f"✅ *Номер подтверждён и найден в системе Birge!*\n\n"
-                f"👤 *Профиль:* {user.name}\n"
-                f"📱 *Телефон:* `{p_formatted}` ({op_or_err})\n"
-                f"⭐️ *Рейтинг доверия:* {user.trust_rating or 5.0} ★\n"
-                f"🛡 *Верификация:* Аккаунт успешно верифицирован (бейдж ✅ активен)\n\n"
-                f"🎉 *Теперь все сообщения гарантированно приходят сюда:*\n"
-                f"• Коды для быстрого входа\n"
-                f"• Запросы от попутчиков\n"
-                f"• Напоминания за 1 час до выезда\n"
-                f"• Экстренные уведомления (SOS)"
-            )
-        else:
-            await _reply(
-                f"⚠️ *Номер {p_formatted} ({op_or_err}) распознан, но пока НЕ зарегистрирован в Birge.*\n\n"
-                f"Мы успешно привязали ваш Telegram-аккаунт к этому номеру.\n\n"
-                f"👉 Зарегистрируйтесь на сайте или в приложении Birge с этим номером, "
-                f"и ваш профиль автоматически станет верифицированным ✅, "
-                f"а все уведомления начнут мгновенно приходить сюда!"
-            )
-
-    # 1. Если отправлен контакт через кнопку «Поделиться номером»
-    if contact:
-        contact_user_id = contact.get("user_id")
-        sender_id = sender.get("id")
-        if contact_user_id != sender_id:
-            await _reply("❌ Вы можете отправить только свой собственный контакт через кнопку «Поделиться номером».")
+    try:
+        message = payload.get("message", {})
+        if not message:
             return {"ok": True}
 
-        contact_phone = contact.get("phone_number", "").strip()
-        if contact_phone:
-            await _process_phone_binding(contact_phone)
+        chat_id: int = message.get("chat", {}).get("id")
+        text: str = (message.get("text") or "").strip()
+        contact: dict = message.get("contact", {})
+        sender: dict = message.get("from", {})
+        first_name: str = sender.get("first_name", "Пользователь")
+        username: str = sender.get("username", "")
+
+        if not chat_id:
             return {"ok": True}
 
-    # 2. Команда /start
-    if text.startswith("/start"):
-        await _reply(
-            f"👋 Привет, *{first_name}*!\n\n"
-            f"Я официальный бот сервиса совместных поездок *Birge* (Бишкек и Кыргызстан) 🚗\n\n"
-            f"Я отправляю вам:\n"
-            f"• 🔐 Коды входа в приложение\n"
-            f"• 🚗 Мгновенные запросы от попутчиков\n"
-            f"• ⏰ Напоминания за час до поездки\n\n"
-            f"Чтобы безопасно привязать номер, нажмите кнопку ниже:\n"
-            f"*«📱 Поделиться номером»*."
-        )
-        return {"ok": True}
+        main_keyboard = {
+            "keyboard": [
+                [{"text": "📱 Поделиться номером", "request_contact": True}],
+                [{"text": "🔍 Проверить статус"}, {"text": "🔔 Тест связи"}],
+                [{"text": "❓ Помощь"}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
 
-    # 3. Команда /status или "Проверить статус"
-    if text in ("/status", "🔍 Проверить статус", "проверить статус", "статус"):
-        from models import TelegramBinding, User
-        binding = db.query(TelegramBinding).filter(TelegramBinding.chat_id == chat_id).first()
-        if binding:
-            phone_tail = (binding.phone_normalized or "".join(filter(str.isdigit, binding.phone or "")))[-9:]
-            query = db.query(User).filter(User.phone == binding.phone)
-            if phone_tail:
-                query = db.query(User).filter((User.phone == binding.phone) | (User.phone.like(f"%{phone_tail}%")))
-            user = query.first()
+        async def _reply(reply_text: str, custom_kb: dict | None = main_keyboard) -> None:
+            await auth.send_telegram_message(chat_id, reply_text, reply_markup=custom_kb)
+
+        async def _process_phone_binding(raw_phone: str) -> None:
+            is_valid, p_e164, p_digits, p_formatted, op_or_err = auth.normalize_kg_phone(raw_phone)
+            if not is_valid:
+                await _reply(
+                    f"❌ *Ошибка в номере телефона:*\n{op_or_err}\n\n"
+                    f"💡 Пример: `0555 123 456` или `+996 555 123 456`."
+                )
+                return
+
+            from models import TelegramBinding, User
+            # 1. Проверяем наличие пользователя в БД Birge
+            user = (
+                db.query(User)
+                .filter(
+                    (User.phone == p_formatted)
+                    | (User.phone == p_e164)
+                    | (User.phone == p_digits)
+                    | (User.phone.like(f"%{p_digits[-9:]}%"))
+                )
+                .first()
+            )
+
+            # 2. Сохраняем/обновляем привязку Telegram (поиск по телефону ИЛИ по chat_id)
+            binding = db.query(TelegramBinding).filter(
+                (TelegramBinding.phone_normalized == p_digits)
+                | (TelegramBinding.phone == p_formatted)
+                | (TelegramBinding.phone == p_e164)
+                | (TelegramBinding.chat_id == chat_id)
+            ).first()
+
+            if binding:
+                binding.chat_id = chat_id
+                binding.phone = p_formatted
+                binding.phone_normalized = p_digits
+            else:
+                binding = TelegramBinding(
+                    phone=p_formatted,
+                    phone_normalized=p_digits,
+                    chat_id=chat_id,
+                )
+                db.add(binding)
+
+            if user:
+                user.is_verified = True
+
+            try:
+                db.commit()
+            except Exception as e:
+                logger.error(f"[Telegram] Ошибка сохранения привязки: {e}")
+                db.rollback()
+                try:
+                    db.query(TelegramBinding).filter(
+                        (TelegramBinding.chat_id == chat_id)
+                        | (TelegramBinding.phone == p_formatted)
+                        | (TelegramBinding.phone_normalized == p_digits)
+                    ).delete(synchronize_session=False)
+                    new_b = TelegramBinding(
+                        phone=p_formatted,
+                        phone_normalized=p_digits,
+                        chat_id=chat_id,
+                    )
+                    db.add(new_b)
+                    if user:
+                        user.is_verified = True
+                    db.commit()
+                except Exception as e2:
+                    logger.error(f"[Telegram] Критическая ошибка повторной привязки: {e2}")
+                    db.rollback()
+
             if user:
                 await _reply(
-                    f"📊 *Статус подключения Birge:*\n\n"
-                    f"✅ Telegram привязан и активен!\n"
-                    f"📱 Номер: `{binding.phone}`\n"
-                    f"👤 Профиль в Birge: *{user.name}*\n"
-                    f"⭐️ Рейтинг: *{user.trust_rating or 5.0} ★*\n"
-                    f"🛡 Верификация: *Подтверждена ✅*\n"
-                    f"🔔 Доставка уведомлений: *Работает штатно*"
+                    f"✅ *Номер подтверждён и найден в системе Birge!*\n\n"
+                    f"👤 *Профиль:* {user.name}\n"
+                    f"📱 *Телефон:* `{p_formatted}` ({op_or_err})\n"
+                    f"⭐️ *Рейтинг доверия:* {user.trust_rating or 5.0} ★\n"
+                    f"🛡 *Верификация:* Аккаунт успешно верифицирован (бейдж ✅ активен)\n\n"
+                    f"🎉 *Теперь все сообщения гарантированно приходят сюда:*\n"
+                    f"• Коды для быстрого входа\n"
+                    f"• Запросы от попутчиков\n"
+                    f"• Напоминания за 1 час до выезда\n"
+                    f"• Экстренные уведомления (SOS)"
                 )
             else:
                 await _reply(
-                    f"📊 *Статус подключения:*\n\n"
-                    f"⚠️ Telegram привязан к номеру `{binding.phone}`, но профиль в базе Birge ещё не создан.\n"
-                    f"Создайте аккаунт в приложении, чтобы связать его."
+                    f"⚠️ *Номер {p_formatted} ({op_or_err}) распознан, но пока НЕ зарегистрирован в Birge.*\n\n"
+                    f"Мы успешно привязали ваш Telegram-аккаунт к этому номеру.\n\n"
+                    f"👉 Зарегистрируйтесь на сайте или в приложении Birge с этим номером, "
+                    f"и ваш профиль автоматически станет верифицированным ✅, "
+                    f"а все уведомления начнут мгновенно приходить сюда!"
                 )
-        else:
+
+        # 1. Если отправлен контакт через кнопку «Поделиться номером»
+        if contact:
+            contact_user_id = contact.get("user_id")
+            sender_id = sender.get("id")
+            if contact_user_id != sender_id:
+                await _reply("❌ Вы можете отправить только свой собственный контакт через кнопку «Поделиться номером».")
+                return {"ok": True}
+
+            contact_phone = contact.get("phone_number", "").strip()
+            if contact_phone:
+                await _process_phone_binding(contact_phone)
+                return {"ok": True}
+
+        # 2. Команда /start
+        if text.startswith("/start"):
             await _reply(
-                "❌ Ваш Telegram ещё не привязан к номеру телефона.\n\n"
-                "Нажмите кнопку *«📱 Поделиться номером»* ниже или напишите ваш номер телефона сообщением."
+                f"👋 Привет, *{first_name}*!\n\n"
+                f"Я официальный бот сервиса совместных поездок *Birge* (Бишкек и Кыргызстан) 🚗\n\n"
+                f"Я отправляю вам:\n"
+                f"• 🔐 Коды входа в приложение\n"
+                f"• 🚗 Мгновенные запросы от попутчиков\n"
+                f"• ⏰ Напоминания за час до поездки\n\n"
+                f"Чтобы безопасно привязать номер, нажмите кнопку ниже:\n"
+                f"*«📱 Поделиться номером»*."
             )
-        return {"ok": True}
-
-    # 4. Команда /check <phone>
-    if text.startswith("/check") or text.lower().startswith("проверить "):
-        args = text.replace("/check", "").replace("проверить", "").strip()
-        if not args:
-            await _reply("💡 Укажите номер для проверки. Пример:\n`/check 0555123456`")
-            return {"ok": True}
-        is_val, pe164, pdig, pfmt, op_err = auth.normalize_kg_phone(args)
-        if not is_val:
-            await _reply(f"❌ Номер невалиден: {op_err}")
             return {"ok": True}
 
-        from models import TelegramBinding, User
-        # Не даём перебирать чужие номера через /check: только свой номер.
-        sender_binding = db.query(TelegramBinding).filter(TelegramBinding.chat_id == chat_id).first()
-        if not sender_binding or sender_binding.phone_normalized != pdig:
+        # 3. Команда /status или "Проверить статус"
+        if text in ("/status", "🔍 Проверить статус", "проверить статус", "статус"):
+            from models import TelegramBinding, User
+            binding = db.query(TelegramBinding).filter(TelegramBinding.chat_id == chat_id).first()
+            if binding:
+                phone_tail = (binding.phone_normalized or "".join(filter(str.isdigit, binding.phone or "")))[-9:]
+                query = db.query(User).filter(User.phone == binding.phone)
+                if phone_tail:
+                    query = db.query(User).filter((User.phone == binding.phone) | (User.phone.like(f"%{phone_tail}%")))
+                user = query.first()
+                if user:
+                    await _reply(
+                        f"📊 *Статус подключения Birge:*\n\n"
+                        f"✅ Telegram привязан и активен!\n"
+                        f"📱 Номер: `{binding.phone}`\n"
+                        f"👤 Профиль в Birge: *{user.name}*\n"
+                        f"⭐️ Рейтинг: *{user.trust_rating or 5.0} ★*\n"
+                        f"🛡 Верификация: *Подтверждена ✅*\n"
+                        f"🔔 Доставка уведомлений: *Работает штатно*"
+                    )
+                else:
+                    await _reply(
+                        f"📊 *Статус подключения:*\n\n"
+                        f"⚠️ Telegram привязан к номеру `{binding.phone}`, но профиль в базе Birge ещё не создан.\n"
+                        f"Создайте аккаунт в приложении, чтобы связать его."
+                    )
+            else:
+                await _reply(
+                    "❌ Ваш Telegram ещё не привязан к номеру телефона.\n\n"
+                    "Нажмите кнопку *«📱 Поделиться номером»* ниже или напишите ваш номер телефона сообщением."
+                )
+            return {"ok": True}
+
+        # 4. Команда /check <phone>
+        if text.startswith("/check") or text.lower().startswith("проверить "):
+            args = text.replace("/check", "").replace("проверить", "").strip()
+            if not args:
+                await _reply("💡 Укажите номер для проверки. Пример:\n`/check 0555123456`")
+                return {"ok": True}
+            is_val, pe164, pdig, pfmt, op_err = auth.normalize_kg_phone(args)
+            if not is_val:
+                await _reply(f"❌ Номер невалиден: {op_err}")
+                return {"ok": True}
+
+            from models import TelegramBinding, User
+            sender_binding = db.query(TelegramBinding).filter(TelegramBinding.chat_id == chat_id).first()
+            if not sender_binding or sender_binding.phone_normalized != pdig:
+                await _reply(
+                    "❌ Проверять можно только свой номер.\n\n"
+                    "Привяжите Telegram через кнопку *«📱 Поделиться номером»*."
+                )
+                return {"ok": True}
+
+            user = db.query(User).filter(User.phone.like(f"%{pdig[-9:]}%")).first()
+            binding = db.query(TelegramBinding).filter(TelegramBinding.phone_normalized == pdig).first()
+
             await _reply(
-                "❌ Проверять можно только свой номер.\n\n"
-                "Привяжите Telegram через кнопку *«📱 Поделиться номером»*."
+                f"🔍 *Результат проверки номера {pfmt} ({op_err}):*\n\n"
+                f"• Регистрация в Birge: {'✅ Да (Пользователь: ' + user.name + ')' if user else '❌ Нет'}\n"
+                f"• Telegram-бот подключен: {'✅ Да' if binding else '❌ Нет (сообщения не доставляются)'}\n"
+                f"• Статус верификации: {'✅ Верифицирован' if user and user.is_verified else '⚠️ Не верифицирован'}"
             )
             return {"ok": True}
 
-        user = db.query(User).filter(User.phone.like(f"%{pdig[-9:]}%")).first()
-        binding = db.query(TelegramBinding).filter(TelegramBinding.phone_normalized == pdig).first()
+        # 5. Команда /test или "Тест связи"
+        if text in ("/test", "🔔 Тест связи", "тест", "проверка"):
+            now_time = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            await _reply(
+                f"🔔 *Тест доставки сообщений пройден!*\n\n"
+                f"✅ Связь с ботом Birge активна.\n"
+                f"🆔 Ваш Chat ID: `{chat_id}`\n"
+                f"⏱ Время проверки: `{now_time}`\n\n"
+                f"Уведомления о поездках и коды подтверждения будут доставляться без задержек."
+            )
+            return {"ok": True}
 
+        # 6. Команда /help или "Помощь"
+        if text in ("/help", "❓ Помощь", "помощь"):
+            await _reply(
+                "ℹ️ *Справка по боту Birge:*\n\n"
+                "• Нажмите *«📱 Поделиться номером»* для безопасной привязки аккаунта\n"
+                "• `/status` — проверить ваш статус привязки и верификации\n"
+                "• `/check <номер>` — проверить наличие номера в системе Birge\n"
+                "• `/test` — проверить доставку сообщений\n\n"
+                "🌐 Веб-версия приложения: [birge-5c900.web.app](https://birge-5c900.web.app)\n"
+                "🆘 Служба поддержки: @birge_support"
+            )
+            return {"ok": True}
+
+        # 7. Любое другое сообщение — для безопасности привязка возможна только через Telegram-контакт
         await _reply(
-            f"🔍 *Результат проверки номера {pfmt} ({op_err}):*\n\n"
-            f"• Регистрация в Birge: {'✅ Да (Пользователь: ' + user.name + ')' if user else '❌ Нет'}\n"
-            f"• Telegram-бот подключен: {'✅ Да' if binding else '❌ Нет (сообщения не доставляются)'}\n"
-            f"• Статус верификации: {'✅ Верифицирован' if user and user.is_verified else '⚠️ Не верифицирован'}"
+            "🔒 Для защиты вашего аккаунта привязка номера телефона выполняется *только* через подтверждённый Telegram-контакт.\n\n"
+            "👇 Нажмите кнопку *«📱 Поделиться номером»* внизу для безопасной привязки."
         )
         return {"ok": True}
 
-    # 5. Команда /test или "Тест связи"
-    if text in ("/test", "🔔 Тест связи", "тест", "проверка"):
-        now_time = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        await _reply(
-            f"🔔 *Тест доставки сообщений пройден!*\n\n"
-            f"✅ Связь с ботом Birge активна.\n"
-            f"🆔 Ваш Chat ID: `{chat_id}`\n"
-            f"⏱ Время проверки: `{now_time}`\n\n"
-            f"Уведомления о поездках и коды подтверждения будут доставляться без задержек."
-        )
+    except Exception as e:
+        logger.exception(f"[Telegram Webhook] Ошибка обработки обновления: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
         return {"ok": True}
-
-    # 6. Команда /help или "Помощь"
-    if text in ("/help", "❓ Помощь", "помощь"):
-        await _reply(
-            "ℹ️ *Справка по боту Birge:*\n\n"
-            "• Нажмите *«📱 Поделиться номером»* для безопасной привязки аккаунта\n"
-            "• `/status` — проверить ваш статус привязки и верификации\n"
-            "• `/check <номер>` — проверить наличие номера в системе Birge\n"
-            "• `/test` — проверить доставку сообщений\n\n"
-            "🌐 Веб-версия приложения: [birge-5c900.web.app](https://birge-5c900.web.app)\n"
-            "🆘 Служба поддержки: @birge_support"
-        )
-        return {"ok": True}
-
-    # 7. Любое другое сообщение — для безопасности привязка возможна только через Telegram-контакт
-    await _reply(
-        "🔒 Для защиты вашего аккаунта привязка номера телефона выполняется *только* через подтверждённый Telegram-контакт.\n\n"
-        "👇 Нажмите кнопку *«📱 Поделиться номером»* внизу для безопасной привязки."
-    )
-    return {"ok": True}
 
 
 # Глобальный in-memory set удалён — состояние теперь хранится в БД (Trip.reminder_sent).
